@@ -72,6 +72,38 @@ test('one query per open or explicit refresh, with no polling timers', async t =
     assert.equal(queries, 2);
 });
 
+test('native menus follow dark and light page colors without starting another query', async t =>
+{
+    const dom = new JSDOM('<!doctype html><main id="page" style="color:rgb(240,240,240)"></main>');
+    const root = dom.window.document.getElementById('page');
+    let queries = 0;
+    let hosts;
+    const stop = mountPanel(root, { getHosts: () => new Promise(resolve => { hosts = resolve; }),
+        getReport: async () => { queries++; return { status: 'ok', snapshot: snapshot() }; }, now: () => now });
+    t.after(() => { stop(); dom.window.close(); });
+    await tick();
+    const check = (scheme, background, foreground) =>
+    {
+        for (const select of root.querySelectorAll('select'))
+        {
+            assert.equal(select.style.colorScheme, scheme);
+            for (const option of select.options)
+            {
+                assert.equal(option.style.backgroundColor, background);
+                assert.equal(option.style.color, foreground);
+            }
+        }
+    };
+    check('dark', 'rgb(32, 32, 32)', 'rgb(245, 245, 245)');
+    hosts([{ hostId: 'local', label: '本机' }, { hostId: 'remote', label: '远程' }]);
+    await tick();
+    check('dark', 'rgb(32, 32, 32)', 'rgb(245, 245, 245)');
+    root.style.color = 'rgb(25,25,25)';
+    await tick();
+    check('light', 'rgb(255, 255, 255)', 'rgb(31, 31, 31)');
+    assert.equal(queries, 1, 'Theme changes must not query usage again');
+});
+
 test('hiding retained settings content cancels immediately and re-opening starts a new query', async t =>
 {
     const calls = [];

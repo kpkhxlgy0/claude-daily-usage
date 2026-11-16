@@ -87,6 +87,28 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     const refresh = panel.querySelector('[data-refresh]');
     const status = panel.querySelector('[data-status]');
     const body = panel.querySelector('tbody');
+    const colorPreference = win.matchMedia?.('(prefers-color-scheme: dark)');
+
+    function syncControlColors()
+    {
+        if (!alive) return;
+        const color = win.getComputedStyle(root).color;
+        const rgb = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(color);
+        const dark = rgb ? Number(rgb[1]) * .2126 + Number(rgb[2]) * .7152 + Number(rgb[3]) * .0722 > 127
+            : colorPreference?.matches === true;
+        const scheme = dark ? 'dark' : 'light';
+        const background = dark ? '#202020' : '#ffffff';
+        const foreground = dark ? '#f5f5f5' : '#1f1f1f';
+        for (const select of [host, range])
+        {
+            select.style.colorScheme = scheme;
+            for (const control of [select, ...select.options])
+            {
+                control.style.backgroundColor = background;
+                control.style.color = foreground;
+            }
+        }
+    }
 
     function render()
     {
@@ -206,6 +228,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
                 option.textContent = entry.label || entry.hostId;
                 host.append(option);
             }
+            syncControlColors();
         }
         catch { /* 主进程重载期间保留已经确认的机器列表。 */ }
     }
@@ -219,7 +242,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         observer.disconnect();
         for (let node = panel; node; node = node.parentElement)
             observer.observe(node, { childList: true, attributes: true,
-                attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'] });
+                attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', 'data-theme'] });
     }
     function stop()
     {
@@ -230,12 +253,14 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         observer.disconnect();
         doc.removeEventListener('visibilitychange', reconcileVisibility);
         win.removeEventListener('pagehide', stop);
+        colorPreference?.removeEventListener('change', syncControlColors);
         panel.remove();
     }
     function reconcileVisibility()
     {
         if (!alive) return;
         if (!panel.isConnected) { stop(); return; }
+        syncControlColors();
         const next = visibleElement(panel);
         observeAncestors();
         if (next === visible) return;
@@ -245,6 +270,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     }
     doc.addEventListener('visibilitychange', reconcileVisibility);
     win.addEventListener('pagehide', stop);
+    colorPreference?.addEventListener('change', syncControlColors);
     reconcileVisibility();
     return stop;
 }

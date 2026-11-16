@@ -1,14 +1,14 @@
 # Daily Usage for Claude++
 
 独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 Standard API 等值美元。
-按机器、日期和模型拆分，包含子代理。版本 0.1.0；需要 Windows、Claude++ 0.3.11 或更新版本。
+按机器、日期和模型拆分，包含子代理。版本 0.1.1；需要 Windows、Claude++ 0.3.11 或更新版本。
 无需安装或启用 Session Stats。
 
 ## 安装和使用
 
 在 **Claude++ Settings → Tweak Store** 搜索 **Daily Usage** 安装，随后打开设置中的 **Daily Usage** 页面。
-运行时无 npm 依赖。也可以从 [v0.1.0 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.0)
-下载 `claude-daily-usage-0.1.0.zip`，解压到长期保留的目录，在 PowerShell7 运行：
+运行时无 npm 依赖。也可以从 [v0.1.1 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.1)
+下载 `claude-daily-usage-0.1.1.zip`，解压到长期保留的目录，在 PowerShell7 运行：
 
 ```powershell
 pwsh -File .\Inject-ClaudePlusPlus.ps1 -CheckOnly
