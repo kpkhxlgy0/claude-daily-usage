@@ -14,9 +14,10 @@ const Local = 'local_33333333-3333-4333-8333-333333333333';
 const Cli = '44444444-4444-4444-8444-444444444444';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-async function fixture(t)
+async function fixture(t, temporaryRoot = os.tmpdir())
 {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-binding-'));
+    // CI 的 TEMP 可能经过目录联接；生产身份检查要求规范目录，测试也使用真实路径。
+    const root = await fs.realpath(await fs.mkdtemp(path.join(temporaryRoot, 'daily-usage-binding-')));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const claudeHome = path.join(root, 'home');
     const claudeData = path.join(root, 'desktop');
@@ -104,4 +105,17 @@ test('semantic binding key excludes irrelevant metadata timestamps', () =>
         workspaceEvidence: 'verified' };
     assert.equal(bindingKey(binding), bindingKey({ ...binding, mtime: 999, lastAssistantUuid: Account }));
     assert.notEqual(bindingKey(binding), bindingKey({ ...binding, workspaceEvidence: 'new-pid' }));
+});
+
+test('temporary-root aliases are canonicalized before constructing verified binding fixtures', async t =>
+{
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-binding-alias-')));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const target = path.join(root, 'target');
+    const alias = path.join(root, 'alias');
+    await fs.mkdir(target);
+    await fs.symlink(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const f = await fixture(t, alias);
+    assert.equal(f.claudeHome.startsWith(target + path.sep), true);
+    assert.equal((await f.bindingSource.listActiveBindings()).length, 1);
 });
