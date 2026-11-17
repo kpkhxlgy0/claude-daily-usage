@@ -15,6 +15,26 @@ const base = "https://claude.ai/v1/code/sessions/session_test";
 const marker = () => makeMarker({ requestId: Request, publisherId: Publisher, viewerId: Machine, binding, now: Now });
 const caps = () => makeCapabilities({ machineId: Machine, publisherId: Publisher });
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test("machine metadata writes allow only the exact owned key and strict CAS value", async t => {
+    const f = fixture(); t.after(() => f.transport.dispose());
+    const path = "/claudepp_daily_usage_machine";
+    const value = { source: "com.kpk.daily-usage", schemaVersion: 1, demandVersion: 1,
+        machineId: Machine, publisherId: Publisher, displayName: "workstation" };
+    const operations = [{ op: "test", path: "", value: {} },
+        { op: "add", path: "/claudepp_daily_usage", value: caps() }, { op: "add", path, value }];
+    await f.transport.patch(binding, operations);
+    assert.deepEqual(JSON.parse(f.calls[0].init.body), { client_metadata_patch: operations });
+    await f.transport.patch(binding, [{ op: "test", path, value }, { op: "remove", path }]);
+    for (const changed of [{ path: path + "/nested", value }, { path: path + "\n", value },
+        { path, value: { ...value, displayName: "bad\nname" } }, { path, value: { ...value, chat: "private" } },
+        { path, value: { ...value, machineId: "invalid" } }]) {
+        const count = f.calls.length;
+        await assert.rejects(f.transport.patch(binding, [{ op: "test", path: "", value: {} },
+            { op: "add", ...changed }]));
+        assert.equal(f.calls.length, count);
+    }
+});
 function detail(change = {}, metadata = { sibling: { untouched: true } }) {
     return { session: { id: "cse_test", environment_kind: "bridge", connection_status: "connected",
         organization_uuid: Organization, client_metadata: metadata, ...change } };

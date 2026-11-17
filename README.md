@@ -1,14 +1,14 @@
 # Daily Usage for Claude++
 
 独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 Standard API 等值美元。
-按机器、日期和模型拆分，包含子代理。版本 0.1.2；需要 Windows、Claude++ 0.3.11 或更新版本。
+按机器、日期和模型拆分，包含子代理。版本 0.1.3；需要 Windows、Claude++ 0.3.11 或更新版本。
 无需安装或启用 Session Stats。
 
 ## 安装和使用
 
 在 **Claude++ Settings → Tweak Store** 搜索 **Daily Usage** 安装，随后打开设置中的 **Daily Usage** 页面。
-运行时无 npm 依赖。也可以从 [v0.1.2 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.2)
-下载 `claude-daily-usage-0.1.2.zip`，解压到长期保留的目录，在 PowerShell7 运行：
+运行时无 npm 依赖。也可以从 [v0.1.3 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.3)
+下载 `claude-daily-usage-0.1.3.zip`，解压到长期保留的目录，在 PowerShell7 运行：
 
 ```powershell
 pwsh -File .\Inject-ClaudePlusPlus.ps1 -CheckOnly
@@ -16,12 +16,14 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 ```
 
 本机默认选中。要查看远程机器，先在当前窗口打开该机器上的 Remote Control 会话，再打开 Daily Usage。
-远程入口以已确认的会话 ID 显示；每个入口读取对应运行机器的全机汇总，同机多个会话可能显示多个入口。
+两端更新至 0.1.3 后，远程入口优先显示运行电脑的主机名；离线保留上次名称，未识别时显示会话 ID。
+每个入口读取对应运行机器的全机汇总，同机多个会话可能显示多个入口。新旧版本混用时统计查询仍可使用。
 **查看端和运行端都必须安装并启用此 tweak，运行端 Claude++ 应用需要保持运行。** 无需在运行端打开统计页。
 
 查询时机与 Codex++ Daily Usage 一致：
 
 - 打开页面、切换机器或点击刷新时，各查询一次；切换日期范围只筛选已返回的数据。
+- 机器名称仅在打开页面时按需读取并缓存，离开页面立即取消；名称读取不会触发用量扫描。
 - 页面保持打开时也不会定时刷新。首次查询会读取保留的历史，可能需要一段时间。
 - 离开、隐藏或关闭页面会取消当前查询；多个窗口的需求互不取消，最后一个需求释放后终止统计 worker。
 - 启用时不扫描用量日志，不创建统计 worker；没有后台轮询或定时统计。
@@ -64,7 +66,7 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 远程机器自己读取日志和计算，通过当前已认证的 Claude Remote Control 会话传输压缩后的数值汇总。
 此 tweak 不请求远程原始日志，不增加通用文件读取/执行权限。查询与取消使用独立请求 ID；
 原生只读状态应答作为事件通知，收到通知才读取一次对应的协议数据，没有定时读取结果。
-协议数据位于独立的 `claudepp_daily_usage*` 元数据键，使用条件更新保留其他功能的数据；
+协议数据及运行电脑的主机名位于独立的 `claudepp_daily_usage*` 元数据键，使用条件更新保留其他功能的数据；
 查询结束或取消后清理自己拥有的键。日志与原始会话文件始终不修改。
 
 原生 Remote Control 接口和会话绑定依赖 Claude 应用版本，升级后若不兼容会停止该远程功能并提示不可用。

@@ -39,7 +39,9 @@ function startMain(api, dependencies = {})
         const transport = require('./remote-transport.cjs').createTransport({
             fetch: (...args) => electron.net.fetch(...args) });
         remote = require('./remote-adapter.cjs').createRemoteAdapter({ service, claudeHome,
-            claudeData: electron.app.getPath('userData'), transport });
+            claudeData: electron.app.getPath('userData'), transport,
+            nameCache: { get: () => api.storage.get('hostNames', []),
+                set: entries => api.storage.set('hostNames', entries) } });
         Promise.resolve(remote.ready).catch(() => api.log.warn('Daily Usage remote listener unavailable'));
     }
     const owners = new Map();
@@ -144,13 +146,13 @@ function startMain(api, dependencies = {})
     function handle(name, handler)
     {
         const channel = Prefix + name;
-        ipcMain.handle(channel, async event =>
+        ipcMain.handle(channel, async (event, payload) =>
         {
             const context = stopped ? null : trusted(event);
             if (!context) return null;
             try
             {
-                const value = await handler(context);
+                const value = await handler(context, payload);
                 return current(context) ? value : null;
             }
             catch { return null; }
@@ -158,8 +160,25 @@ function startMain(api, dependencies = {})
         handlers.push(channel);
     }
 
-    handle('hosts', async context =>
+    handle('hosts', async (context, payload) =>
     {
+        if (payload !== undefined)
+        {
+            if (!record(payload) || !normalizeThreadId(payload.requestId)
+                || Object.keys(payload).length !== 1) return null;
+            const owner = ownerFor(context);
+            if (owner.queries.has(payload.requestId)) return null;
+            const controller = new AbortController();
+            owner.queries.set(payload.requestId, controller);
+            try { await remote?.refreshHostNames?.(context.frame, { signal: controller.signal }); }
+            catch { /* 名称读取失败时继续使用已确认的缓存。 */ }
+            finally
+            {
+                owner.queries.delete(payload.requestId);
+                release(owner);
+            }
+            if (controller.signal.aborted) return null;
+        }
         const hosts = [{ hostId: 'local', label: `本机 · ${os.hostname()}` }];
         let candidates;
         try { candidates = await remote?.getHosts?.(context.frame); }

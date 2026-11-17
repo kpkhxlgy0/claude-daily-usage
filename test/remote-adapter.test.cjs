@@ -50,6 +50,7 @@ function hub()
     const held = [];
     let hold = false;
     let getHook;
+    let patchHook;
     let notifyHook;
     let reorderReads = false;
     const streams = new Set();
@@ -70,7 +71,7 @@ function hub()
             async get(binding, options)
             {
                 calls.push({ name, kind: 'get', binding });
-                if (getHook) await getHook(name, options);
+                if (getHook) await getHook(name, options, binding);
                 if (options?.signal?.aborted) throw new Error('aborted');
                 return { session: { id: binding.bridgeSessionId }, metadata: reorderReads
                     ? reordered(copy(metadata)) : copy(metadata) };
@@ -79,6 +80,7 @@ function hub()
             {
                 calls.push({ name, kind: 'patch', operations: copy(operations), binding });
                 if (options?.signal?.aborted) throw new Error('aborted');
+                if (patchHook) await patchHook(name, operations, options);
                 const candidate = copy(metadata);
                 for (const op of operations)
                 {
@@ -185,6 +187,7 @@ function hub()
     }
     return { transport, fetch, calls, emit, held, get metadata() { return metadata; }, set metadata(value) { metadata = value; },
         hold(value) { hold = value; }, getHook(value) { getHook = value; },
+        patchHook(value) { patchHook = value; },
         notifyHook(value) { notifyHook = value; },
         reorderReads(value) { reorderReads = value; },
         disconnect(name) { for (const watcher of watchers) if (watcher.name === name) void watcher.dispose(); },
@@ -216,10 +219,10 @@ function fixture(t, options = {})
     const makeTransport = name => options.realTransport
         ? createTransport({ fetch: network.fetch(name), now: () => Time }) : network.transport(name);
     const runner = createRemoteAdapter({ service, transport: makeTransport('runner'), bindingSource: localSource,
-        now: () => Time, frameBinding: frame => frame.binding });
+        now: () => Time, frameBinding: frame => frame.binding, hostname: options.hostname || (() => 'Remote-PC') });
     const viewer = createRemoteAdapter({ service: { ...service, query() { assert.fail('viewer scan'); } },
         transport: makeTransport('viewer'), bindingSource: source(), now: () => Time,
-        frameBinding: frame => frame.binding });
+        frameBinding: frame => frame.binding, nameCache: options.nameCache });
     const frame = { url: 'app://localhost/code/session_fixture', binding: Binding };
     t.after(async () => { await Promise.all([runner.dispose(), viewer.dispose()]); });
     return { network, queries, runner, viewer, frame, localSource };
@@ -264,7 +267,7 @@ test('end-to-end demand watches before writes, lazily scans once, and has zero i
     assert.equal(result.status, 'ok', JSON.stringify(result));
     assert.deepEqual(result.snapshot, snapshot());
     assert.deepEqual(f.network.metadata.unrelated, { preserve: true });
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
     const calls = f.network.calls.filter(value => value.name === 'viewer');
     const watch = calls.findIndex(value => value.kind === 'watch');
     const write = calls.findIndex(value => value.kind === 'patch');
@@ -386,7 +389,7 @@ test('actual transport and native SSE support concurrent viewers with one bounde
     assert.equal(f.queries[1].signal.aborted, false);
     f.queries[1].resolve({ status: 'ok', snapshot: snapshot() });
     assert.equal((await second).status, 'ok');
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
     const idle = f.network.calls.length;
     await flush(); await flush();
     assert.equal(f.network.calls.length, idle);
@@ -513,7 +516,7 @@ test('failed query notification cancels its reservation without retry or collect
     assert.equal(value.error, 'transport');
     assert.equal(f.queries.length, 0);
     assert.equal(f.network.calls.filter(call => call.eventKind === 'query').length, 1);
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
 });
 
 test('matching unsupported native response fails promptly and late foreign results cannot replace state', async t =>
@@ -555,4 +558,354 @@ test('native metadata object key reordering preserves identity and unchanged rep
     changed.coverage.files++;
     f.queries[2].resolve({ status: 'ok', snapshot: reordered(changed) });
     assert.equal((await request).error, 'snapshot-replay', 'same revision with changed data remains invalid');
+});
+
+test('runner advertises the hostname in its existing PATCH and cleans up only its own name', async t =>
+{
+    const f = fixture(t, { realTransport: true });
+    await f.runner.ready;
+    assert.equal(f.network.metadata[p.MachineKey]?.displayName, 'Remote-PC');
+    const patches = f.network.calls.filter(call => call.name === 'runner' && call.kind === 'patch');
+    assert.equal(patches.length, 1);
+    assert.deepEqual(patches[0].operations.filter(op => op.op === 'add').map(op => op.path).sort(),
+        ['/claudepp_daily_usage', '/claudepp_daily_usage_machine']);
+    const foreign = p.makeMachine({ ...Identity, publisherId: Binding.accountId }, 'Replacement-PC');
+    f.network.metadata[p.MachineKey] = foreign;
+    await f.runner.dispose();
+    assert.deepEqual(f.network.metadata, { unrelated: { preserve: true }, [p.MachineKey]: foreign });
+});
+
+test('host name demand uses one GET, no collector or watch, and has zero idle traffic', async t =>
+{
+    const writes = [];
+    const f = fixture(t, { realTransport: true, nameCache: { get: () => [], set: entries => writes.push(entries) } });
+    await f.runner.ready;
+    const baseline = f.network.calls.length;
+    await f.viewer.discover(f.frame);
+    assert.equal(f.viewer.getHosts(f.frame)[0].label, '远程 · session_fixture');
+    assert.equal(f.network.calls.length, baseline);
+    await f.viewer.refreshHostNames(f.frame);
+    assert.equal(f.viewer.getHosts(f.frame)[0].label, '远程 · Remote-PC');
+    assert.deepEqual(f.network.calls.slice(baseline).map(call => call.kind), ['get']);
+    assert.equal(f.queries.length, 0);
+    assert.deepEqual(writes, [[{ hostId: hostId(Binding), machineId: Identity.machineId, displayName: 'Remote-PC' }]]);
+    await flush(); await flush();
+    assert.equal(f.network.calls.length, baseline + 1);
+});
+
+test('old endpoints and malformed names preserve statistics and the last verified machine label', async t =>
+{
+    const f = fixture(t);
+    await f.runner.ready;
+    await f.viewer.discover(f.frame);
+    await f.viewer.refreshHostNames(f.frame);
+    const current = copy(f.network.metadata[p.MachineKey]);
+    for (const value of [undefined, { ...current, displayName: 'bad\nname' },
+        { ...current, publisherId: Binding.accountId }, { ...current, machineId: Binding.accountId },
+        { ...current, displayName: 'forged', sessionTitle: 'private chat' }])
+    {
+        if (value === undefined) delete f.network.metadata[p.MachineKey];
+        else f.network.metadata[p.MachineKey] = value;
+        await f.viewer.refreshHostNames(f.frame);
+        assert.equal(f.viewer.getHosts(f.frame)[0].label, '远程 · Remote-PC');
+    }
+    delete f.network.metadata[p.MachineKey];
+    const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+    await until(() => f.queries.length === 1);
+    f.queries[0].resolve({ status: 'ok', snapshot: snapshot() });
+    assert.equal((await request).status, 'ok');
+    f.network.metadata[p.CapsKey] = p.makeCapabilities({ ...Identity, machineId: Binding.accountId });
+    await f.viewer.refreshHostNames(f.frame);
+    assert.equal(f.viewer.getHosts(f.frame)[0].label, '远程 · session_fixture');
+});
+
+test('persisted names use exact host identity and errors retain only verified labels', async t =>
+{
+    const writes = [];
+    const f = fixture(t, { nameCache: { get: () => [
+        { hostId: hostId(Binding), machineId: Identity.machineId, displayName: 'Cached-PC' },
+        { hostId: hostId({ ...Binding, bridgeSessionId: 'session_second' }), machineId: Identity.machineId,
+            displayName: 'not a hostname', title: 'private chat' },
+        { hostId: hostId({ ...Binding, bridgeSessionId: 'cse_third' }), machineId: Identity.machineId,
+            displayName: 'Alias-PC' },
+        { hostId: hostId({ ...Binding, bridgeSessionId: 'session_fourth' }), machineId: Identity.machineId,
+            displayName: 'bad\u0000name' },
+        Object.assign(Object.create({ hostId: hostId({ ...Binding, bridgeSessionId: 'session_fifth' }),
+            machineId: Identity.machineId, displayName: 'Inherited-PC' }), { title: 'private', chat: 'private', other: true })
+    ], set: entries => writes.push(entries) } });
+    await f.runner.ready;
+    await f.viewer.discover(f.frame);
+    for (const bridgeSessionId of ['session_second', 'session_third', 'session_fourth', 'session_fifth'])
+    {
+        f.frame.binding = { ...Binding, bridgeSessionId };
+        await f.viewer.discover(f.frame);
+    }
+    assert.deepEqual(f.viewer.getHosts(f.frame).map(value => value.label), ['远程 · Cached-PC',
+        '远程 · session_second', '远程 · session_third', '远程 · session_fourth', '远程 · session_fifth']);
+    f.network.getHook(name => { if (name === 'viewer') throw new Error('offline'); });
+    await f.viewer.refreshHostNames(f.frame);
+    assert.equal(f.viewer.getHosts(f.frame)[0].label, '远程 · Cached-PC');
+    assert.deepEqual(writes, []);
+    const other = { binding: { ...Binding, organizationId: Binding.accountId }, url: f.frame.url };
+    await f.viewer.discover(other);
+    assert.equal(f.viewer.getHosts(other)[0].label, '远程 · session_fixture');
+});
+
+function nameViewer(t, get, nameCache)
+{
+    const viewer = createRemoteAdapter({ service: { ready: Promise.resolve(), getIdentity: () => Identity },
+        transport: { get, async dispose() {} }, bindingSource: source(), frameBinding: frame => frame.binding, nameCache });
+    t.after(() => viewer.dispose());
+    return viewer;
+}
+const namedDetail = displayName => ({ metadata: { [p.CapsKey]: p.makeCapabilities(Identity),
+    [p.MachineKey]: p.makeMachine(Identity, displayName) } });
+
+test('cancelled name refresh stops queued GETs and ignores a late completion after reopen', async t =>
+{
+    const reads = [];
+    const writes = [];
+    const viewer = nameViewer(t, (binding, { signal }) =>
+    {
+        const pending = deferred();
+        reads.push({ binding, signal, ...pending });
+        return pending.promise;
+    }, { get: () => [], set: entries => writes.push(entries) });
+    const frame = { url: 'app://localhost/settings', binding: Binding };
+    await viewer.discover(frame);
+    const controller = new AbortController();
+    const old = viewer.refreshHostNames(frame, { signal: controller.signal });
+    await until(() => reads.length === 1);
+    controller.abort();
+    await old;
+    assert.equal(reads[0].signal.aborted, true);
+    const current = viewer.refreshHostNames(frame);
+    await until(() => reads.length === 2);
+    reads[1].resolve(namedDetail('New-PC'));
+    await current;
+    reads[0].resolve(namedDetail('Old-PC'));
+    await flush(); await flush();
+    assert.equal(viewer.getHosts(frame)[0].label, '远程 · New-PC');
+    assert.deepEqual(writes, [[{ hostId: hostId(Binding), machineId: Identity.machineId, displayName: 'New-PC' }]]);
+});
+
+test('name refresh snapshots bindings, limits concurrency to four and cancels remaining queue', async t =>
+{
+    const reads = [];
+    const viewer = nameViewer(t, (binding, { signal }) =>
+    {
+        const pending = deferred();
+        reads.push({ binding, signal, ...pending });
+        return pending.promise;
+    });
+    const frame = { url: 'app://localhost/settings' };
+    for (let index = 0; index < 9; index++)
+    {
+        frame.binding = { ...Binding, bridgeSessionId: 'session_' + index };
+        await viewer.discover(frame);
+    }
+    const controller = new AbortController();
+    const request = viewer.refreshHostNames(frame, { signal: controller.signal });
+    await until(() => reads.length === 4);
+    frame.binding = { ...Binding, bridgeSessionId: 'session_later' };
+    await viewer.discover(frame);
+    reads[0].resolve(namedDetail('First-PC'));
+    await until(() => reads.length === 5);
+    controller.abort();
+    await request;
+    assert.ok(reads.every(read => read.signal.aborted));
+    for (const read of reads.slice(1)) read.resolve(namedDetail('Late-PC'));
+    await flush(); await flush();
+    assert.equal(reads.length, 5);
+    assert.deepEqual(viewer.getHosts(frame).map(value => value.label), ['远程 · First-PC',
+        ...Array.from({ length: 8 }, (_, index) => '远程 · session_' + (index + 1)), '远程 · session_later']);
+});
+
+test('cancellation between the GET signal check and worker continuation prevents name cache writes', async t =>
+{
+    const pending = deferred();
+    const writes = [];
+    const controller = new AbortController();
+    const viewer = nameViewer(t, () => pending.promise, { get: () => [],
+        set: entries => writes.push({ entries, aborted: controller.signal.aborted }) });
+    const frame = { binding: Binding, url: 'app://localhost/settings' };
+    await viewer.discover(frame);
+    const request = viewer.refreshHostNames(frame, { signal: controller.signal });
+    pending.promise.then(() => queueMicrotask(() => controller.abort()));
+    pending.resolve(namedDetail('Cancelled-PC'));
+    await request;
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(writes, []);
+    assert.equal(viewer.getHosts(frame)[0].label, '远程 · session_fixture');
+});
+
+test('name refresh has one total 3500ms deadline across concurrent request waves', async t =>
+{
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const reads = [];
+    const viewer = nameViewer(t, (_binding, { signal }) =>
+    {
+        const pending = deferred();
+        reads.push({ signal, ...pending });
+        return pending.promise;
+    });
+    const frame = { url: 'app://localhost/settings' };
+    for (let index = 0; index < 9; index++)
+    {
+        frame.binding = { ...Binding, bridgeSessionId: 'session_' + index };
+        await viewer.discover(frame);
+    }
+    const request = viewer.refreshHostNames(frame);
+    await until(() => reads.length === 4);
+    t.mock.timers.tick(3000);
+    reads[0].resolve(namedDetail('Within-Deadline'));
+    await until(() => reads.length === 5);
+    t.mock.timers.tick(500);
+    await request;
+    assert.equal(reads.length, 5);
+    assert.ok(reads.every(read => read.signal.aborted));
+    for (const read of reads.slice(1)) read.resolve(namedDetail('Over-Deadline'));
+    await flush();
+    assert.equal(viewer.getHosts(frame)[1].label, '远程 · session_1');
+});
+
+test('newer concurrent refresh wins even when the older refresh is not cancelled', async t =>
+{
+    const reads = [];
+    const viewer = nameViewer(t, () =>
+    {
+        const pending = deferred(); reads.push(pending); return pending.promise;
+    });
+    const frame = { binding: Binding, url: 'app://localhost/settings' };
+    await viewer.discover(frame);
+    const first = viewer.refreshHostNames(frame);
+    await until(() => reads.length === 1);
+    const second = viewer.refreshHostNames(frame);
+    await until(() => reads.length === 2);
+    reads[1].resolve(namedDetail('Newer-PC'));
+    await second;
+    reads[0].resolve(namedDetail('Older-PC'));
+    await first;
+    assert.equal(viewer.getHosts(frame)[0].label, '远程 · Newer-PC');
+});
+
+test('aborted and unknown-frame name demands perform no reads or cache writes', async t =>
+{
+    const viewer = nameViewer(t, () => assert.fail('unexpected read'));
+    const frame = { binding: Binding, url: 'app://localhost/settings' };
+    await viewer.discover(frame);
+    await viewer.refreshHostNames({}, {});
+    const controller = new AbortController(); controller.abort();
+    await viewer.refreshHostNames(frame, { signal: controller.signal });
+    await viewer.dispose();
+    await viewer.refreshHostNames(frame);
+});
+
+test('name cache bounds loaded and saved labels without retaining any remote session content', async t =>
+{
+    const entries = Array.from({ length: 258 }, (_, index) => ({
+        hostId: hostId({ ...Binding, bridgeSessionId: 'session_' + index }),
+        machineId: Identity.machineId, displayName: 'Cached-' + index }));
+    const writes = [];
+    const viewer = nameViewer(t, async () => ({ ...namedDetail('New-PC'),
+        session: { title: 'private chat', messages: ['private conversation'] } }),
+    { get: () => entries, set: value => writes.push(value) });
+    const frame = { binding: { ...Binding, bridgeSessionId: 'session_0' }, url: 'app://localhost/settings' };
+    await viewer.discover(frame);
+    frame.binding = { ...Binding, bridgeSessionId: 'session_257' };
+    await viewer.discover(frame);
+    assert.deepEqual(viewer.getHosts(frame).map(value => value.label), ['远程 · session_0', '远程 · Cached-257']);
+    const other = { binding: Binding, url: frame.url };
+    await viewer.discover(other);
+    await viewer.refreshHostNames(other);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].length, 256);
+    assert.equal(writes[0].some(entry => entry.hostId.endsWith(':session_2')), false);
+    assert.deepEqual(writes[0].at(-1), { hostId: hostId(Binding), machineId: Identity.machineId, displayName: 'New-PC' });
+    assert.ok(writes[0].every(entry => Object.keys(entry).sort().join(',') === 'displayName,hostId,machineId'));
+});
+
+test('adapter disposal settles outstanding name demands even if the transport ignores cancellation', async t =>
+{
+    const reads = [];
+    const writes = [];
+    const viewer = nameViewer(t, (_binding, { signal }) =>
+    {
+        const pending = deferred(); reads.push({ signal, ...pending }); return pending.promise;
+    }, { get: () => [], set: entries => writes.push(entries) });
+    const frame = { binding: Binding, url: 'app://localhost/settings' };
+    await viewer.discover(frame);
+    const demand = viewer.refreshHostNames(frame);
+    await until(() => reads.length === 1);
+    await viewer.dispose();
+    await demand;
+    assert.equal(reads[0].signal.aborted, true);
+    reads[0].resolve(namedDetail('Late-PC'));
+    await flush();
+    assert.deepEqual(writes, []);
+    assert.equal(viewer.getHosts(frame)[0].label, '远程 · session_fixture');
+});
+
+test('invalid hostname or prior malformed name metadata never blocks existing statistics capability', async t =>
+{
+    for (const options of [{ hostname: () => 'bad\nname' }, {}, { hostname: () => { throw new Error('no hostname'); } }])
+    {
+        const f = fixture(t, { ...options, realTransport: true });
+        if (!options.hostname) f.network.metadata[p.MachineKey] = { sessionTitle: 'private chat' };
+        await f.runner.ready;
+        assert.deepEqual(f.network.metadata[p.CapsKey], p.makeCapabilities(Identity));
+        await f.viewer.discover(f.frame);
+        const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+        await until(() => f.queries.length === 1);
+        f.queries[0].resolve({ status: 'ok', snapshot: snapshot() });
+        assert.equal((await request).status, 'ok');
+    }
+});
+
+test('runner advertisement retries one native CAS conflict without losing unrelated metadata or statistics', async t =>
+{
+    const f = fixture(t, { realTransport: true });
+    let changed = false;
+    f.network.patchHook((name, operations) =>
+    {
+        if (name === 'runner' && !changed && operations.some(op => op.path === '/claudepp_daily_usage_machine'))
+        {
+            changed = true;
+            f.network.metadata.unrelated = { preserve: 'new native metadata' };
+        }
+    });
+    await f.runner.ready;
+    assert.equal(f.network.calls.filter(call => call.name === 'runner' && call.kind === 'patch'
+        && call.operations.some(op => op.op === 'add')).length, 2);
+    assert.equal(f.network.calls.filter(call => call.name === 'runner' && call.kind === 'get').length, 2);
+    assert.equal(f.network.calls.filter(call => call.name === 'runner' && call.kind === 'stream').length, 1);
+    assert.equal(f.network.metadata[p.MachineKey]?.displayName, 'Remote-PC');
+    assert.deepEqual(f.network.metadata.unrelated, { preserve: 'new native metadata' });
+    await f.viewer.discover(f.frame);
+    const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+    await until(() => f.queries.length === 1);
+    f.queries[0].resolve({ status: 'ok', snapshot: snapshot() });
+    assert.equal((await request).status, 'ok');
+});
+
+test('runner advertisement never retries arbitrary transport failures and bounds repeated conflicts', async t =>
+{
+    for (const conflict of [false, true])
+    {
+        const f = fixture(t, { realTransport: true });
+        let attempts = 0;
+        f.network.patchHook((name, operations) =>
+        {
+            if (name !== 'runner' || !operations.some(op => op.op === 'add')) return;
+            attempts++;
+            if (conflict) f.network.metadata.unrelated = { revision: attempts };
+            else throw new Error('offline');
+        });
+        await f.runner.ready;
+        assert.equal(attempts, conflict ? 2 : 1);
+        assert.equal(Object.hasOwn(f.network.metadata, p.CapsKey), false);
+        const before = f.network.calls.length;
+        await flush(); await flush();
+        assert.equal(f.network.calls.length, before);
+    }
 });

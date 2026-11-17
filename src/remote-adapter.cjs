@@ -1,7 +1,9 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { hostname: readHostname } = require('node:os');
 const { isDeepStrictEqual } = require('node:util');
+const { normalizeThreadId } = require('./protocol.cjs');
 const protocol = require('./remote-protocol.cjs');
 const { createRemoteBindings, bindingKey } = require('./remote-bindings.cjs');
 const { readFrameBinding } = require('./claude-binding.cjs');
@@ -9,6 +11,9 @@ const { readFrameBinding } = require('./claude-binding.cjs');
 const CleanupMs = 2000;
 const MaxActive = 8;
 const MaxRecords = 4096;
+const MaxHostNames = 256;
+const NameRefreshMs = 3500;
+const NameConcurrency = 4;
 const failure = code => Object.assign(new Error(code), { code });
 const aborted = () => Object.assign(failure('cancelled'), { name: 'AbortError' });
 const hostKey = binding => `${binding.organizationId}:${binding.bridgeSessionId}`;
@@ -16,13 +21,15 @@ const equal = isDeepStrictEqual;
 const ownedPath = key => '/' + key;
 
 function createRemoteAdapter({ service, claudeHome, claudeData, transport, now = Date.now,
-    bindingSource, frameBinding = readFrameBinding })
+    bindingSource, frameBinding = readFrameBinding, hostname = readHostname, nameCache })
 {
     const source = bindingSource || createRemoteBindings({ claudeHome, claudeData });
     const runners = new Map();
     const frames = new WeakMap();
     const cache = new Map();
     const accepted = new Map();
+    const names = new Map();
+    const nameGenerations = new Map();
     const callers = new Set();
     const tasks = new Set();
     const lifetime = new AbortController();
@@ -33,6 +40,25 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
     let refreshAgain = false;
     let refreshQueued = false;
     let disposal;
+
+    try
+    {
+        const entries = nameCache?.get();
+        if (Array.isArray(entries)) for (const entry of entries.slice(-MaxHostNames))
+        {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+                || Object.keys(entry).length !== 3
+                || !['hostId', 'machineId', 'displayName'].every(key => Object.hasOwn(entry, key))
+                || typeof entry.hostId !== 'string') continue;
+            const [organizationId, bridgeSessionId, extra] = entry.hostId.split(':');
+            if (extra !== undefined || !organizationId || normalizeThreadId(organizationId) !== organizationId
+                || !bridgeSessionId || protocol.normalizeBridgeId(bridgeSessionId) !== bridgeSessionId
+                || !entry.machineId || normalizeThreadId(entry.machineId) !== entry.machineId
+                || !entry.displayName || protocol.normalizeMachineName(entry.displayName) !== entry.displayName) continue;
+            names.set(entry.hostId, { machineId: entry.machineId, displayName: entry.displayName });
+        }
+    }
+    catch { /* 缓存损坏不影响统计查询。 */ }
 
     function track(promise)
     {
@@ -80,6 +106,14 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             { op: 'remove', path: ownedPath(key) }], { signal });
     }
 
+    async function removeAdvertisement(runner, signal)
+    {
+        if (runner.capabilities) await removeValue(runner.binding, protocol.CapsKey,
+            runner.capabilities, signal).catch(() => {});
+        if (runner.machine) await removeValue(runner.binding, protocol.MachineKey,
+            runner.machine, signal).catch(() => {});
+    }
+
     function sweep(runner)
     {
         for (const [id, entry] of runner.records)
@@ -120,8 +154,7 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
         await runner.listening?.catch(() => {});
         await cleanupScope(async signal =>
         {
-            if (runner.capabilities) await removeValue(runner.binding, protocol.CapsKey,
-                runner.capabilities, signal).catch(() => {});
+            await removeAdvertisement(runner, signal);
             for (const [id, entry] of runner.records)
                 if (cleanupResults && entry.result) await removeValue(runner.binding, protocol.resultKey(id), entry.result, signal)
                     .catch(() => {});
@@ -223,8 +256,7 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             runner.failed = true;
             for (const entry of runner.records.values()) entry.controller?.abort();
             await runner.watch?.dispose().catch(() => {});
-            await cleanupScope(signal => runner.capabilities
-                ? removeValue(runner.binding, protocol.CapsKey, runner.capabilities, signal) : Promise.resolve());
+            await cleanupScope(signal => removeAdvertisement(runner, signal));
         }
     }
 
@@ -235,15 +267,33 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             const signal = runner.controller.signal;
             runner.watch = await step(transport.watch(runner.binding, { signal }), signal);
             check(signal);
-            const detail = await step(transport.get(runner.binding, { signal }), signal);
+            let detail = await step(transport.get(runner.binding, { signal }), signal);
             const value = protocol.makeCapabilities(identity);
-            const previous = detail.metadata[protocol.CapsKey];
-            const operations = Object.hasOwn(detail.metadata, protocol.CapsKey)
-                ? [{ op: 'test', path: ownedPath(protocol.CapsKey), value: previous }]
-                : [{ op: 'test', path: '', value: detail.metadata }];
-            operations.push({ op: 'add', path: ownedPath(protocol.CapsKey), value });
             runner.capabilities = value;
-            await step(transport.patch(runner.binding, operations, { signal }), signal);
+            for (let attempt = 0; ; attempt++)
+            {
+                const operations = [{ op: 'test', path: '', value: detail.metadata },
+                    { op: 'add', path: ownedPath(protocol.CapsKey), value }];
+                let machine;
+                try
+                {
+                    const previous = detail.metadata[protocol.MachineKey];
+                    if (!Object.hasOwn(detail.metadata, protocol.MachineKey)
+                        || protocol.validateMachine(previous, protocol.makeCapabilities(previous)).ok)
+                    {
+                        machine = protocol.makeMachine(identity, hostname());
+                        operations.push({ op: 'add', path: ownedPath(protocol.MachineKey), value: machine });
+                    }
+                }
+                catch { /* 无效主机名或旧元数据不得阻断原有统计能力。 */ }
+                runner.machine = machine;
+                try { await step(transport.patch(runner.binding, operations, { signal }), signal); break; }
+                catch (error)
+                {
+                    if (attempt || error?.code !== 'metadata-conflict') throw error;
+                    detail = await step(transport.get(runner.binding, { signal }), signal);
+                }
+            }
             check(signal);
             runner.failed = false;
             runner.listening = track(listen(runner));
@@ -252,8 +302,7 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
         {
             runner.failed = true;
             await runner.watch?.dispose().catch(() => {});
-            await cleanupScope(signal => runner.capabilities
-                ? removeValue(runner.binding, protocol.CapsKey, runner.capabilities, signal) : Promise.resolve());
+            await cleanupScope(signal => removeAdvertisement(runner, signal));
         }
     }
 
@@ -324,6 +373,72 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
     {
         const previous = cache.get(hostId);
         return { ...(previous || {}), status: previous?.snapshot ? 'stale' : 'unavailable', error, progress: null };
+    }
+
+    function acceptName(hostId, metadata)
+    {
+        const caps = metadata?.[protocol.CapsKey];
+        if (!protocol.validateCapabilities(caps).ok) return;
+        const previous = names.get(hostId);
+        const machine = metadata[protocol.MachineKey];
+        if (protocol.validateMachine(machine, caps).ok)
+        {
+            if (previous?.machineId === machine.machineId && previous.displayName === machine.displayName) return;
+            names.delete(hostId);
+            if (names.size >= MaxHostNames) names.delete(names.keys().next().value);
+            names.set(hostId, { machineId: machine.machineId, displayName: machine.displayName });
+        }
+        else if (previous && previous.machineId !== caps.machineId) names.delete(hostId);
+        else return;
+        try
+        {
+            Promise.resolve(nameCache?.set([...names].map(([hostId, value]) => ({ hostId, ...value }))))
+                .catch(() => {});
+        }
+        catch { /* 本地缓存不可写时仍保留当前页面名称。 */ }
+    }
+
+    async function refreshHostNames(frame, { signal } = {})
+    {
+        if (stopped || signal?.aborted) return;
+        const selected = frame && frames.get(frame);
+        if (!selected?.size) return;
+        const bindings = [...selected].map(([hostId, value]) => ({ hostId, binding: { ...value.binding } }));
+        const generation = Symbol();
+        for (const { hostId } of bindings) nameGenerations.set(hostId, generation);
+        const controller = new AbortController();
+        const stop = () => controller.abort();
+        signal?.addEventListener('abort', stop, { once: true });
+        lifetime.signal.addEventListener('abort', stop, { once: true });
+        callers.add(controller);
+        const timer = setTimeout(stop, NameRefreshMs);
+        timer.unref?.();
+        let index = 0;
+        async function worker()
+        {
+            while (!stopped && !controller.signal.aborted && index < bindings.length)
+            {
+                const { hostId, binding } = bindings[index++];
+                try
+                {
+                    const detail = await step(transport.get(binding, { signal: controller.signal }), controller.signal);
+                    check(controller.signal);
+                    if (nameGenerations.get(hostId) === generation) acceptName(hostId, detail?.metadata);
+                }
+                catch { /* 离线、旧端点和取消都保留已验证的名称，不重试。 */ }
+            }
+        }
+        try { await Promise.all(Array.from({ length: Math.min(NameConcurrency, bindings.length) }, worker)); }
+        finally
+        {
+            clearTimeout(timer);
+            stop();
+            signal?.removeEventListener('abort', stop);
+            lifetime.signal.removeEventListener('abort', stop);
+            callers.delete(controller);
+            for (const { hostId } of bindings)
+                if (nameGenerations.get(hostId) === generation) nameGenerations.delete(hostId);
+        }
     }
 
     async function query(hostId, { signal, frame } = {})
@@ -474,7 +589,7 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
         {
             const selected = frame && frames.get(frame);
             return selected ? [...selected.values()].map(value => ({ hostId: hostKey(value.binding),
-                label: `远程 · ${value.binding.bridgeSessionId}` })) : [];
+                label: `远程 · ${names.get(hostKey(value.binding))?.displayName || value.binding.bridgeSessionId}` })) : [];
         },
         async discover(frame)
         {
@@ -492,6 +607,7 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             selected.set(key, { binding: normalized, url });
         },
         query: (hostId, options) => track(query(hostId, options)),
+        refreshHostNames: (frame, options) => track(refreshHostNames(frame, options)),
         dispose()
         {
             if (disposal) return disposal;

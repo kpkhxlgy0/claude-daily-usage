@@ -6,6 +6,7 @@ const { normalizeThreadId, validateSnapshot, MaxSnapshotBytes, FutureSkewMs } = 
 
 const Source = "com.kpk.daily-usage";
 const CapsKey = "claudepp_daily_usage";
+const MachineKey = "claudepp_daily_usage_machine";
 const MaxDemandMs = 300000;
 const MaxCompressedBytes = 64 * 1024;
 const Prefixes = { query: "d411ea01", result: "d411ea02", cancel: "d411ea03" };
@@ -65,6 +66,27 @@ function makeCapabilities(identity) {
 function validateCapabilities(value) {
     return fields(value, ["source", "schemaVersion", "demandVersion", "machineId", "publisherId"])
         && version(value) && uuid(value.machineId) && uuid(value.publisherId) ? { ok: true } : invalid("invalid");
+}
+
+function normalizeMachineName(value) {
+    if (typeof value !== "string" || /\p{Cc}/u.test(value)) return null;
+    const name = value.trim();
+    return name.length > 0 && name.length <= 256 ? name : null;
+}
+
+function makeMachine(identity, displayName) {
+    const caps = makeCapabilities(identity);
+    const name = normalizeMachineName(displayName);
+    if (!name) throw new TypeError("Invalid Daily Usage machine name");
+    return { ...caps, displayName: name };
+}
+
+function validateMachine(value, capabilities) {
+    return validateCapabilities(capabilities).ok
+        && fields(value, ["source", "schemaVersion", "demandVersion", "machineId", "publisherId", "displayName"])
+        && version(value) && value.machineId === capabilities.machineId && value.publisherId === capabilities.publisherId
+        && typeof value.displayName === "string" && normalizeMachineName(value.displayName) === value.displayName
+        ? { ok: true } : invalid("invalid");
 }
 
 function makeMarker(options, action = "query", original) {
@@ -162,6 +184,7 @@ function validateResult(value, options = {}) {
     } catch { return invalid("invalid"); }
 }
 
-module.exports = { createRequestId, signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey,
+module.exports = { createRequestId, signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey, MachineKey,
+    normalizeMachineName, makeMachine, validateMachine,
     requestKey, resultKey, makeCapabilities, makeMarker, validateMarker, validateCapabilities, makeResult,
     validateResult, MaxDemandMs };

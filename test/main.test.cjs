@@ -201,3 +201,50 @@ test('stop before queued discovery prevents deferred remote work', async t =>
     await pending;
     assert.equal(discoveries, 0);
 });
+
+test('host-name demand is cancellable per frame and never starts a collector', async t =>
+{
+    const calls = [];
+    const f = fixture(t, { getHosts: () => [{ hostId: 'runner', label: '远程 · 工作电脑' }],
+        refreshHostNames(owner, { signal })
+        {
+            const pending = deferred();
+            calls.push({ owner, signal, ...pending });
+            return pending.promise;
+        } });
+    const one = frame();
+    const two = frame();
+    await f.invoke('hosts', one);
+    assert.equal(calls.length, 0, 'Legacy/cache-only list does no name lookup');
+    const a = f.invoke('hosts', one, { requestId: RequestId });
+    const b = f.invoke('hosts', two, { requestId: RequestId });
+    await flush();
+    assert.equal(calls.length, 2);
+    assert.equal(f.queries.length, 0);
+    f.send('cancel', one, { requestId: RequestId });
+    assert.equal(calls[0].signal.aborted, true);
+    assert.equal(calls[1].signal.aborted, false);
+    calls[0].resolve(); calls[1].resolve();
+    assert.equal(await a, null);
+    assert.equal((await b)[1].label, '远程 · 工作电脑');
+    assert.equal(two.sender.window.listenerCount('hide'), 0);
+});
+
+test('host-name requests reject malformed demand and stop on window hide', async t =>
+{
+    let active;
+    const f = fixture(t, { getHosts: () => [], refreshHostNames(_frame, { signal })
+    {
+        const pending = deferred(); active = { signal, ...pending }; return pending.promise;
+    } });
+    const owner = frame();
+    for (const payload of [{}, { requestId: 'bad' }, { requestId: RequestId, extra: true }])
+        assert.equal(await f.invoke('hosts', owner, payload), null);
+    assert.equal(active, undefined);
+    const pending = f.invoke('hosts', owner, { requestId: RequestId });
+    await flush();
+    owner.sender.window.emit('hide');
+    assert.equal(active.signal.aborted, true);
+    active.resolve();
+    assert.equal(await pending, null);
+});

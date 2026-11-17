@@ -3,8 +3,8 @@
 const { randomUUID } = require("node:crypto");
 const { inflateSync } = require("node:zlib");
 const { MaxSnapshotBytes, normalizeThreadId } = require("./protocol.cjs");
-const { signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey,
-    validateCapabilities, validateMarker, validateResult } = require("./remote-protocol.cjs");
+const { signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey, MachineKey,
+    validateCapabilities, validateMachine, validateMarker, validateResult } = require("./remote-protocol.cjs");
 
 const MaxBodyBytes = 1024 * 1024;
 const MaxFrameChars = 64 * 1024;
@@ -23,6 +23,7 @@ function cancelBody(response) {
 
 function ownedKey(key) {
     if (key === CapsKey) return { kind: "caps" };
+    if (key === MachineKey) return { kind: "machine" };
     const match = /^claudepp_daily_usage_(request|result)_([0-9a-f-]{36})$/.exec(key);
     const parsed = match && match[0] === key && parseSignalId(match[2]);
     return parsed?.kind === "query" ? { kind: match[1], requestId: parsed.requestId } : null;
@@ -32,6 +33,9 @@ function validOwnedValue(key, value, binding) {
     const owned = ownedKey(key);
     if (!owned) return false;
     if (owned.kind === "caps") return validateCapabilities(value).ok;
+    if (owned.kind === "machine") return record(value) && validateMachine(value, {
+        source: value.source, schemaVersion: value.schemaVersion, demandVersion: value.demandVersion,
+        machineId: value.machineId, publisherId: value.publisherId }).ok;
     if (!record(value) || value.requestId !== owned.requestId) return false;
     if (owned.kind === "request") return validateMarker(value, { binding, now: value.requestedAt }).ok;
     let machineId;

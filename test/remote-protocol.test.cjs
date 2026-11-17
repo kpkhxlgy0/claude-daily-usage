@@ -24,6 +24,28 @@ function result(status = "ok", overrides = {}) {
         status, snapshot: snapshot(), error: "unavailable", now: Now, ...overrides });
 }
 
+test("machine names are separate bounded metadata tied to current capabilities", () => {
+    const identity = { machineId: Machine, publisherId: Publisher };
+    const caps = protocol.makeCapabilities(identity);
+    assert.equal(protocol.MachineKey, "claudepp_daily_usage_machine");
+    const value = protocol.makeMachine(identity, "  工作站 <desktop>  ");
+    assert.deepEqual(value, { source: "com.kpk.daily-usage", schemaVersion: 1, demandVersion: 1,
+        ...identity, displayName: "工作站 <desktop>" });
+    assert.deepEqual(protocol.validateMachine(value, caps), { ok: true });
+    assert.equal(protocol.validateMachine({ ...value, displayName: "x".repeat(256) }, caps).ok, true);
+    for (const displayName of ["", "  ", "x".repeat(257), "bad\nname", "bad\u0000name", "bad\u0085name", null]) {
+        assert.throws(() => protocol.makeMachine(identity, displayName));
+        assert.equal(protocol.validateMachine({ ...value, displayName }, caps).ok, false);
+    }
+    for (const changed of [{ ...value, displayName: " untrimmed " }, { ...value, title: "private chat" },
+        { ...value, machineId: Viewer }, { ...value, publisherId: Viewer }, { ...value, schemaVersion: 2 }, null]) {
+        assert.equal(protocol.validateMachine(changed, caps).ok, false);
+    }
+    assert.equal(protocol.validateMachine(value).ok, false);
+    assert.equal(protocol.validateMachine(value, { ...caps, title: "chat" }).ok, false);
+    assert.equal(protocol.validateCapabilities({ ...caps, displayName: "host" }).ok, false);
+});
+
 test("signal IDs preserve UUID ownership and decode only the three owned prefixes", () => {
     assert.match(protocol.createRequestId(), /^d411ea01-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     for (const [kind, prefix] of [["query", "d411ea01"], ["result", "d411ea02"], ["cancel", "d411ea03"]]) {

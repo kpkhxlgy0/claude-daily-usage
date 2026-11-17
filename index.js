@@ -30,7 +30,7 @@ function visibleElement(element)
     return true;
 }
 
-function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = Date.now })
+function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancelHosts = () => {}, now = Date.now })
 {
     const doc = root.ownerDocument;
     const win = doc.defaultView;
@@ -40,6 +40,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     let fetching = false;
     let visible = false;
     let activeQuery;
+    let activeHostsQuery;
     const hostNames = new Map([['local', '本机']]);
     const panel = doc.createElement('section');
     panel.className = 'daily-usage-panel';
@@ -214,24 +215,39 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         }
     }
 
+    function cancelHostLookup()
+    {
+        const query = activeHostsQuery;
+        activeHostsQuery = null;
+        if (!query) return;
+        query.controller.abort();
+        try { Promise.resolve(cancelHosts(query.id)).catch(() => {}); }
+        catch { /* 主进程已退出时本地取消仍然生效。 */ }
+    }
+
     async function loadHosts()
     {
+        cancelHostLookup();
+        const query = activeHostsQuery = { id: win.crypto.randomUUID(), controller: new win.AbortController() };
         try
         {
-            const hosts = await getHosts();
-            if (!alive || !visibleElement(panel)) return;
+            const hosts = await getHosts({ requestId: query.id, signal: query.controller.signal });
+            if (!alive || !visibleElement(panel) || activeHostsQuery !== query || query.controller.signal.aborted) return;
             for (const entry of hosts)
             {
-                if (hostNames.has(entry.hostId)) continue;
-                hostNames.set(entry.hostId, entry.label || entry.hostId);
-                const option = doc.createElement('option');
+                const label = entry.label || entry.hostId;
+                hostNames.set(entry.hostId, label);
+                const option = [...host.options].find(value => value.value === entry.hostId)
+                    || doc.createElement('option');
                 option.value = entry.hostId;
-                option.textContent = entry.label || entry.hostId;
-                host.append(option);
+                option.textContent = label;
+                if (!option.parentElement) host.append(option);
             }
             syncControlColors();
+            render();
         }
         catch { /* 主进程重载期间保留已经确认的机器列表。 */ }
+        finally { if (activeHostsQuery === query) activeHostsQuery = null; }
     }
 
     host.addEventListener('change', () => { void update(true); });
@@ -251,6 +267,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         alive = false;
         visible = false;
         cancelActive();
+        cancelHostLookup();
         observer.disconnect();
         doc.removeEventListener('visibilitychange', reconcileVisibility);
         win.removeEventListener('pagehide', stop);
@@ -267,7 +284,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         if (next === visible) return;
         visible = next;
         if (visible) { void loadHosts(); void update(); }
-        else cancelActive();
+        else { cancelActive(); cancelHostLookup(); }
     }
     doc.addEventListener('visibilitychange', reconcileVisibility);
     win.addEventListener('pagehide', stop);
@@ -332,13 +349,15 @@ function startRenderer(api, { window: win = window, document: doc = document } =
     const cleanups = new Set();
     const client = createQueryClient(api);
     let stopped = false;
-    const data = { getHosts: async () =>
+    const data = { getHosts: async ({ requestId, signal }) =>
         {
             await api.ipc.invoke('discover');
-            return api.ipc.invoke('hosts');
+            if (signal.aborted) return [];
+            return api.ipc.invoke('hosts', { requestId });
         },
         getReport: (hostId, options) => client.query(hostId, options),
-        cancelReport: requestId => client.cancel(requestId) };
+        cancelReport: requestId => client.cancel(requestId),
+        cancelHosts: requestId => api.ipc.send('cancel', { requestId }) };
     function mount(root)
     {
         const release = mountPanel(root, data);

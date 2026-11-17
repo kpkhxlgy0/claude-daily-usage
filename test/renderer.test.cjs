@@ -104,6 +104,50 @@ test('native menus follow dark and light page colors without starting another qu
     assert.equal(queries, 1, 'Theme changes must not query usage again');
 });
 
+test('leaving cancels name demand and a late old list cannot replace reopened names', async t =>
+{
+    const requests = [];
+    const cancelled = [];
+    const { root } = await setup(t, undefined, {
+        getHosts: options => new Promise(resolve => requests.push({ ...options, resolve })),
+        cancelHosts: requestId => cancelled.push(requestId)
+    });
+    root.hidden = true;
+    await tick();
+    assert.equal(requests[0].signal.aborted, true);
+    assert.deepEqual(cancelled, [requests[0].requestId]);
+    root.hidden = false;
+    await tick();
+    assert.notEqual(requests[0].requestId, requests[1].requestId);
+    requests[1].resolve([{ hostId: 'remote-1', label: '远程 · 新名称' }]);
+    await tick();
+    requests[0].resolve([{ hostId: 'remote-1', label: '远程 · 旧名称' }]);
+    await tick();
+    assert.equal(root.querySelector('option[value="remote-1"]').textContent, '远程 · 新名称');
+});
+
+test('reopening refreshes existing remote labels while preserving selection and theme', async t =>
+{
+    let label = '远程 · 办公电脑';
+    const { root, dom } = await setup(t, undefined, {
+        getHosts: async () => [{ hostId: 'remote-1', label }]
+    });
+    const host = root.querySelector('[aria-label="统计机器"]');
+    host.value = 'remote-1';
+    host.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+    root.hidden = true;
+    await tick();
+    label = '远程 · 工作电脑';
+    root.hidden = false;
+    await tick(); await tick();
+    assert.equal(host.value, 'remote-1');
+    assert.equal(host.options.length, 2);
+    assert.equal(host.selectedOptions[0].textContent, label);
+    assert.ok(host.selectedOptions[0].style.backgroundColor);
+    assert.match(root.querySelector('[data-status]').textContent, /工作电脑/);
+});
+
 test('hiding retained settings content cancels immediately and re-opening starts a new query', async t =>
 {
     const calls = [];
@@ -263,4 +307,29 @@ test('conversation navigation during identity discovery is not lost', async t =>
     await tick();
     assert.equal(pending.length, 2);
     pending[1]();
+});
+
+test('leaving while discovery is pending prevents a later host-name request', async t =>
+{
+    const dom = new JSDOM('<!doctype html><main id="settings"></main>');
+    const calls = [];
+    let discover;
+    let page;
+    const controller = startRenderer({ ipc: mockIpc((name, payload) =>
+    {
+        calls.push({ name, payload });
+        if (name === 'discover') return new Promise(resolve => { discover = resolve; });
+        return Promise.resolve([]);
+    }), log: { info() {} }, settings: { registerPage(value)
+    {
+        page = value;
+        return { unregister() {} };
+    } } }, { window: dom.window, document: dom.window.document });
+    t.after(() => { controller.stop(); dom.window.close(); });
+    const release = page.render(dom.window.document.getElementById('settings'));
+    await tick();
+    release();
+    discover();
+    await tick();
+    assert.deepEqual(calls.map(value => value.name), ['discover']);
 });
