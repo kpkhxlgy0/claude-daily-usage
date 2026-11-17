@@ -178,8 +178,9 @@ function validateResult(value, options = {}) {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         const snapshot = JSON.parse(text);
         const checked = validateSnapshot(snapshot, { now });
-        if (!checked.ok) return checked;
+        if (!checked.ok && checked.reason !== "update-required") return checked;
         if (snapshot.machineId !== machineId || snapshot.publisherId !== publisherId) return invalid("identity");
+        if (!checked.ok) return checked;
         return { ok: true, snapshot };
     } catch { return invalid("invalid"); }
 }

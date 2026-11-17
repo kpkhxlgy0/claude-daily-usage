@@ -68,15 +68,15 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancel
     <header><h2>Daily Usage</h2><select aria-label="统计机器"><option value="local">本机</option></select>
     <select aria-label="统计时间范围"><option value="1">今天</option><option value="7">最近 7 天</option>
     <option value="30">最近 30 天</option></select><button type="button" data-refresh>刷新</button></header>
-    <p>北京时间 · 包含子代理 · 按公开 Standard API 价格折算；金额不代表订阅账单。</p>
+    <p>北京时间 · 包含子代理 · 按公开价格与缓存写入估算规则折算；金额不代表订阅账单或额度扣减。</p>
     <div data-status role="status" aria-live="polite">正在读取统计…</div>
     <div class="daily-usage-cards">
         <div class="daily-usage-card"><small>Token 总量</small><strong data-summary="tokens">—</strong></div>
-        <div class="daily-usage-card"><small>API 等值美元（已定价部分）</small><strong data-summary="usd">—</strong></div>
+        <div class="daily-usage-card"><small>费用估算（USD）</small><strong data-summary="usd">—</strong></div>
         <div class="daily-usage-card"><small>请求数</small><strong data-summary="requests">—</strong></div>
     </div><p data-updated></p><p data-coverage></p>
     <div class="daily-usage-scroll"><table aria-label="每日模型用量"><thead><tr>
-    <th>日期</th><th>模型</th><th>请求</th><th>普通输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th><th>API 等值美元</th>
+    <th>日期</th><th>模型</th><th>请求</th><th>普通输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th><th>费用估算（USD）</th>
     </tr></thead><tbody></tbody></table></div>
     <p data-empty></p><p>机器列表包含本机和本窗口打开过的远程会话。远程机器需要安装并启用 Daily Usage。</p>
     <p data-price></p>`;
@@ -126,11 +126,12 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancel
         {
             panel.querySelector(`[data-summary="${key}"]`).textContent = snapshot
                 ? (key === 'usd' ? (totals.requests && totals.unpriced === totals.requests && totals.usd === 0 ? '未定价'
-                    : dollars.format(totals.usd)) : counts.format(totals[key])) : '—';
+                    : dollars.format(totals.usd) + (totals.estimated ? '（含估算）' : '')
+                        + (totals.unpriced ? ' + 未定价部分' : '')) : counts.format(totals[key])) : '—';
         }
         const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
         status.textContent = reportState?.error === 'snapshot-update-required'
-            ? '远端暂不支持按需查询，请确认两端均已启用兼容版本的 Claude++ Daily Usage。'
+            ? '统计计价版本需要更新，请确认两端均已启用 Claude++ Daily Usage 0.1.5 或更高版本，再刷新统计。'
             : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
             : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
             : snapshot ? `${hostNames.get(host.value) || host.value} · 统计已更新`
@@ -140,7 +141,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancel
             ? `数据截至 ${timeFormat.format(snapshot.generatedAt)}（北京时间） · 已读取 ${snapshot.from} 至 ${snapshot.to}` : '';
         const gaps = [];
         if (totals.unpriced) gaps.push(`${counts.format(totals.unpriced)} 次请求未定价`);
-        if (totals.estimated) gaps.push(`${counts.format(totals.estimated)} 次旧版请求为估算`);
+        if (totals.estimated) gaps.push(`${counts.format(totals.estimated)} 次请求的缓存写入含未知部分，按 5 分钟价格估算`);
         if (snapshot?.coverage.failedFiles) gaps.push(`${snapshot.coverage.failedFiles} 个日志读取失败`);
         if (snapshot?.coverage.skippedRecords) gaps.push(`${snapshot.coverage.skippedRecords} 条记录无法归属`);
         if (snapshot) gaps.push(...snapshot.coverage.warnings);
@@ -152,7 +153,8 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancel
             const values = [row.date, row.model, counts.format(row.requests), counts.format(row.uncachedInputTokens),
                 counts.format(row.cachedInputTokens), counts.format(row.cacheWriteTokens), counts.format(row.outputTokens),
                 row.unpricedRequests === row.requests && row.usd === 0 ? '未定价'
-                    : dollars.format(row.usd) + (row.unpricedRequests ? ' + 未定价部分' : '')];
+                    : dollars.format(row.usd) + (row.estimatedRequests ? '（含估算）' : '')
+                        + (row.unpricedRequests ? ' + 未定价部分' : '')];
             for (const value of values)
             {
                 const cell = doc.createElement('td');
@@ -164,7 +166,8 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, cancel
         panel.querySelector('[data-empty]').textContent = snapshot && !rows.length
             ? '所选日期没有可统计的请求。' : '';
         panel.querySelector('[data-price]').textContent = snapshot
-            ? `价格表日期：${snapshot.pricing.asOf}。仅含模型 Token 费用，不含图像生成等工具独立收费。` : '';
+            ? `价格表日期：${snapshot.pricing.asOf}。明确的 1 小时缓存写入按 1 小时价格，其余按 5 分钟价格；`
+                + '时长未完整覆盖时标记“含估算”。仅含模型 Token 费用，不含工具独立收费，不代表订阅账单或额度扣减。' : '';
     }
 
     function cancelActive()
@@ -363,7 +366,7 @@ function startRenderer(api, { window: win = window, document: doc = document } =
         return cleanup;
     }
     const page = api.settings?.registerPage({ id: 'daily-usage', title: 'Daily Usage',
-        description: '每日 Token 与 API 等值费用', iconSvg: PageIconSvg, render: mount });
+        description: '每日 Token 与费用估算（USD）', iconSvg: PageIconSvg, render: mount });
     let discovering = false;
     let rediscover = false;
     let queued = false;

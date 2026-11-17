@@ -1,14 +1,14 @@
 # Daily Usage for Claude++
 
-独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 Standard API 等值美元。
-按机器、日期和模型拆分，包含子代理。版本 0.1.4；需要 Windows、Claude++ 0.3.11 或更新版本。
+独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和费用估算（USD）。
+按机器、日期和模型拆分，包含子代理。版本 0.1.5；需要 Windows、Claude++ 0.3.11 或更新版本。
 无需安装或启用 Session Stats。
 
 ## 安装和使用
 
 在 **Claude++ Settings → Tweak Store** 搜索 **Daily Usage** 安装，随后打开设置中的 **Daily Usage** 页面。
-运行时无 npm 依赖。也可以从 [v0.1.4 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.4)
-下载 `claude-daily-usage-0.1.4.zip`，解压到长期保留的目录，在 PowerShell7 运行：
+运行时无 npm 依赖。也可以从 [v0.1.5 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.5)
+下载 `claude-daily-usage-0.1.5.zip`，解压到长期保留的目录，在 PowerShell7 运行：
 
 ```powershell
 pwsh -File .\Inject-ClaudePlusPlus.ps1 -CheckOnly
@@ -18,7 +18,7 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 本机默认选中。要查看远程机器，先在当前窗口打开该机器上的 Remote Control 会话，再打开 Daily Usage。
 机器下拉框中本机只显示“本机”，只有一个远程入口时只显示“远程”；多个远程入口时显示名称以便区分。
 两端更新至 0.1.3 或更高版本后可识别运行电脑的主机名；离线保留上次名称，未识别时显示会话 ID。
-每个入口读取对应运行机器的全机汇总，同机多个会话可能显示多个入口。新旧版本混用时统计查询仍可使用。
+每个入口读取对应运行机器的全机汇总，同机多个会话可能显示多个入口。新计价规则要求两端均更新至 0.1.5 或更高版本。
 **查看端和运行端都必须安装并启用此 tweak，运行端 Claude++ 应用需要保持运行。** 无需在运行端打开统计页。
 
 查询时机与 Codex++ Daily Usage 一致：
@@ -45,18 +45,28 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 - 按实际响应标识合并流式片段，跨文件去重；复制、fork 和子代理中重复出现的同一响应不会重复计费。
 - 已发生、后来移出上下文的请求仍计入。fork 继承记录优先采用可验证的原始日期；缺失原始时间时显示覆盖缺口，
   不把 fork 时间冒充计费时间。
-- 日志损坏、超大记录、用量缺失、未知模型及缓存保留时间不明均会提示缺口；美元仅合计已定价部分。
+- 日志损坏、超大记录、用量缺失、未知模型及非法缓存时长均会提示缺口；美元仅合计可定价部分。
+- 缓存时长缺失或未完整覆盖写入总量时，未知部分按 5 分钟价格估算；金额旁显示“含估算”。
 - 多台机器分别查看，不直接相加，避免跨机器复制日志造成重复计费。
 
-## API 等值费用
+## 费用估算（USD）
 
 采用 **2026-11-17 的公开 Standard API 价格**。普通输入、缓存读取、5 分钟/1 小时缓存写入和输出分别定价。
 支持的模型和精确 ID 见 [定价依据](docs/pricing-evidence.md)；未识别的 ID 保留 Token 并标为未定价。
 
-这是按该价格表折算的美元，不是订阅账单或历史发票；历史日期也使用这张价格表。
+明确报告的 1 小时缓存写入按普通输入的 2 倍计价，其余缓存写入按 5 分钟价格（普通输入的 1.25 倍）估算。
+有效时长分项之和小于写入总量时，金额标记“含估算”，覆盖说明显示受影响请求数；完整分项不标记额外估算。
+分项超量、负数、非整数或其他非法数据不会补齐或截断：保留 Token，仅排除该请求的缓存写入金额并显示未定价部分。
+Haiku 5.5 总输入超过 100,000 Token 的 5 倍参考价格规则保持不变。
+
+这是参考估算，不是订阅账单、额度扣减或历史发票；历史日期也使用这张价格表。
 不推算 Fast、Batch、地区溢价、合同折扣、税费或搜索等工具单独收费。
 来源：[Anthropic 官方价格](https://platform.claude.com/docs/en/about-claude/pricing)、
 [缓存计费](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)。
+
+0.1.5 使用新的计价依据标识 `claude-client-estimate`。旧版 `standard` 美元汇总和远程结果会提示更新，
+不会混入新金额。原始 Token 解析缓存继续复用，下一次打开页面或手动刷新时重新计价，不会后台扫描。
+旧解析缓存曾将非法时长和缺失时长都保存为未知值，无法恢复区别；此类历史未知值按缺失估算并显示“含估算”。
 
 ## 数据和远程
 

@@ -503,7 +503,8 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             received = response.metadata[protocol.resultKey(marker.requestId)];
             const parsed = protocol.validateResult(received, { requestId: marker.requestId,
                 publisherId: caps.publisherId, machineId: caps.machineId, now: now() });
-            if (!parsed.ok) throw failure('snapshot-invalid');
+            if (!parsed.ok) throw failure(parsed.reason === 'update-required'
+                ? 'snapshot-update-required' : 'snapshot-invalid');
             if (received.status !== 'ok') throw failure(received.status === 'cancelled' ? 'cancelled' : 'source-unavailable');
             check(controller.signal);
             const history = accepted.get(hostId);

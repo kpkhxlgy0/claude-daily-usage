@@ -40,6 +40,7 @@ function validCachedData(data, sourceId)
             && typeof event.model === 'string' && event.model.length <= 128
             && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(event.model)
             && UsageFields.every(key => event[key] === null || validTokens(event[key]))
+            && (event.cacheWriteTtlInvalid === undefined || typeof event.cacheWriteTtlInvalid === 'boolean')
             && validTokens(event.inputTokens) && typeof event.usageComplete === 'boolean');
 }
 
@@ -48,7 +49,7 @@ function resolveTimestamps(events)
     const records = new Map();
     const timestamps = new Map();
     const proofFields = ['messageId', 'requestId', 'timestamp', 'model', 'inherited',
-        'originSessionId', 'originRecordId', ...UsageFields];
+        'originSessionId', 'originRecordId', 'cacheWriteTtlInvalid', ...UsageFields];
     for (const event of events)
     {
         if (!event.sessionId || !event.recordId) continue;
@@ -68,6 +69,7 @@ function resolveTimestamps(events)
             || visiting.size >= MaxForkDepth || visiting.has(event)) return null;
         const ancestor = records.get(event.originSessionId + ':' + event.originRecordId);
         if (!ancestor || event.model !== ancestor.model
+            || Boolean(event.cacheWriteTtlInvalid) !== Boolean(ancestor.cacheWriteTtlInvalid)
             || UsageFields.some(field => event[field] !== ancestor[field])) return null;
         const sameResponse = event.messageId && ancestor.messageId ? event.messageId === ancestor.messageId
             : event.requestId && ancestor.requestId && event.requestId === ancestor.requestId;
@@ -87,6 +89,7 @@ function resolveTimestamps(events)
 
 function mergeResponse(target, event)
 {
+    if (event.cacheWriteTtlInvalid) target.cacheWriteTtlInvalid = true;
     if (event.timestamp !== null)
         target.timestamp = target.timestamp === null ? event.timestamp : Math.min(target.timestamp, event.timestamp);
     let less = false;
@@ -311,6 +314,7 @@ function createCollector({ claudeHome, cacheDir, now = Date.now, onProgress } = 
         coverage.skippedRecords += ambiguous.size;
         const rows = new Map();
         let unpricedRequests = 0;
+        let estimatedRequests = 0;
         for (const event of responses.values())
         {
             if (event.timestamp === null)
@@ -350,6 +354,7 @@ function createCollector({ claudeHome, cacheDir, now = Date.now, onProgress } = 
             for (const field of countFields) row[field] += usage[field];
             row.usd += price.usd;
             if (price.unpriced) { row.unpricedRequests++; unpricedRequests++; }
+            if (price.estimated) { row.estimatedRequests++; estimatedRequests++; }
         }
         if (coverage.failedFiles) coverage.warnings.push(`有 ${coverage.failedFiles} 个用量文件读取失败。`);
         if (coverage.discoveryErrors) coverage.warnings.push(`有 ${coverage.discoveryErrors} 处历史目录无法读取。`);
@@ -362,6 +367,8 @@ function createCollector({ claudeHome, cacheDir, now = Date.now, onProgress } = 
             coverage.warnings.push(`${coverage.unresolvedInheritedRequests} 次继承响应缺少可确认的原始日期，已排除日期统计。`);
         if (coverage.overflowRequests) coverage.warnings.push(`${coverage.overflowRequests} 次请求超出安全统计范围，已排除。`);
         if (unpricedRequests) coverage.warnings.push(`${unpricedRequests} 次请求有未定价部分；美元仅含可定价用量。`);
+        if (estimatedRequests)
+            coverage.warnings.push(`${estimatedRequests} 次请求的缓存写入时长未完整覆盖，未知部分按 5 分钟价格估算。`);
         if (coverage.cacheErrors) coverage.warnings.push('用量缓存写入失败，仍显示已读取的统计。');
         const result = [...rows.values()].sort((left, right) => right.date.localeCompare(left.date)
             || left.model.localeCompare(right.model));

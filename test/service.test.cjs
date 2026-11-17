@@ -13,7 +13,7 @@ function body()
     return { generatedAt: Date.parse('2026-11-17T12:00:00Z'), timezone: 'Asia/Shanghai',
         from: '2026-10-19', to: '2026-11-17', rows: [],
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard', asOf: '2026-11-17', source: 'https://platform.claude.com/docs/en/about-claude/pricing' } };
+        pricing: { basis: 'claude-client-estimate', asOf: '2026-11-17', source: 'https://platform.claude.com/docs/en/about-claude/pricing' } };
 }
 
 async function setup(t)
@@ -52,6 +52,36 @@ test('cold service exposes stable machine identity without scanning logs', async
     assert.notEqual(service.getIdentity().machineId, 'changed');
     assert.equal(workers.length, 0);
     assert.equal(service.getState().snapshot, undefined);
+});
+
+test('a legacy dollar summary requires update without scanning and is replaced only by an explicit query', async t =>
+{
+    const { root, workers, service } = await setup(t);
+    const identity = service.getIdentity();
+    await service.dispose();
+    const filename = path.join(root, '.daily-usage/summary.json');
+    const legacy = { ...body(), ...identity, schemaVersion: 1, source: 'com.kpk.daily-usage', revision: 1 };
+    legacy.pricing.basis = 'standard';
+    await fs.writeFile(filename, JSON.stringify(legacy));
+    const restarted = createService({ claudeHome: root, dataDir: path.join(root, 'data'),
+        workerFactory: options =>
+        {
+            const worker = new EventEmitter();
+            worker.options = options;
+            worker.postMessage = () => {};
+            worker.terminate = async () => {};
+            workers.push(worker);
+            return worker;
+        }, now: () => body().generatedAt });
+    t.after(() => restarted.dispose());
+    await restarted.ready;
+    assert.equal(workers.length, 0);
+    assert.equal(restarted.getState().snapshot, undefined);
+    assert.equal(restarted.getState().error, 'snapshot-update-required');
+    assert.deepEqual(JSON.parse(await fs.readFile(filename, 'utf8')), legacy);
+    const next = await started(restarted, workers);
+    next.worker.emit('message', { type: 'result', report: body() });
+    assert.equal((await next.result).snapshot.pricing.basis, 'claude-client-estimate');
 });
 
 async function bounded(promise, operation)

@@ -1,6 +1,6 @@
 'use strict';
 
-const Pricing = Object.freeze({ basis: 'standard', asOf: '2026-11-17',
+const Pricing = Object.freeze({ basis: 'claude-client-estimate', asOf: '2026-11-17',
     source: 'https://platform.claude.com/docs/en/about-claude/pricing' });
 const Million = 1000000;
 const HaikuLongContextInput = 100000;
@@ -34,16 +34,17 @@ function validTokens(value)
 }
 
 function priceRequest({ model, inputTokens, uncachedInputTokens, cachedInputTokens = 0,
-    cacheWriteTokens = 0, cacheWrite5mTokens, cacheWrite1hTokens, outputTokens, usageComplete = true } = {})
+    cacheWriteTokens = 0, cacheWrite5mTokens, cacheWrite1hTokens, cacheWriteTtlInvalid = false,
+    outputTokens, usageComplete = true } = {})
 {
     if (![inputTokens, uncachedInputTokens, cachedInputTokens, cacheWriteTokens, outputTokens].every(validTokens)
         || inputTokens !== uncachedInputTokens + cachedInputTokens + cacheWriteTokens)
     {
-        return { usd: 0, unpriced: true, uncachedInputTokens: 0, reasons: ['invalid-usage'] };
+        return { usd: 0, unpriced: true, estimated: false, uncachedInputTokens: 0, reasons: ['invalid-usage'] };
     }
     const reasons = [];
     const rate = Rates.get(model);
-    if (!rate) return { usd: 0, unpriced: true, uncachedInputTokens, reasons: ['unknown-model'] };
+    if (!rate) return { usd: 0, unpriced: true, estimated: false, uncachedInputTokens, reasons: ['unknown-model'] };
     let [inputRate, outputRate, cachedRate] = rate;
     if (model === 'claude-haiku-5-5' && inputTokens > HaikuLongContextInput)
     {
@@ -52,17 +53,21 @@ function priceRequest({ model, inputTokens, uncachedInputTokens, cachedInputToke
         cachedRate *= 5;
     }
     let subtotal = uncachedInputTokens * inputRate + cachedInputTokens * cachedRate + outputTokens * outputRate;
-    if (cacheWriteTokens)
+    let estimated = false;
+    const write5m = cacheWrite5mTokens ?? 0;
+    const write1h = cacheWrite1hTokens ?? 0;
+    if (cacheWriteTtlInvalid || !validTokens(write5m) || !validTokens(write1h)
+        || write5m + write1h > cacheWriteTokens)
     {
-        if (!validTokens(cacheWrite5mTokens) || !validTokens(cacheWrite1hTokens)
-            || cacheWrite5mTokens + cacheWrite1hTokens !== cacheWriteTokens)
-        {
-            reasons.push('cache-write-ttl');
-        }
-        else subtotal += inputRate * (cacheWrite5mTokens * 1.25 + cacheWrite1hTokens * 2);
+        reasons.push('cache-write-ttl');
+    }
+    else
+    {
+        subtotal += inputRate * ((cacheWriteTokens - write1h) * 1.25 + write1h * 2);
+        estimated = write5m + write1h < cacheWriteTokens;
     }
     if (!usageComplete) reasons.push('incomplete-usage');
-    return { usd: Number((subtotal / Million).toFixed(12)), unpriced: reasons.length > 0,
+    return { usd: Number((subtotal / Million).toFixed(12)), unpriced: reasons.length > 0, estimated,
         uncachedInputTokens, reasons };
 }
 

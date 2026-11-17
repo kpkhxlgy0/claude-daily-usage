@@ -17,12 +17,43 @@ function snapshot() {
     return { schemaVersion: 1, source: "com.kpk.daily-usage", machineId: Machine, publisherId: Publisher,
         revision: 1, generatedAt: Now, timezone: "Asia/Shanghai", from: "2026-10-19", to: "2026-11-17",
         rows: [], coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "standard", asOf: "2026-11-17", source: "https://platform.claude.com/docs/en/about-claude/pricing" } };
+        pricing: { basis: "claude-client-estimate", asOf: "2026-11-17", source: "https://platform.claude.com/docs/en/about-claude/pricing" } };
 }
 function result(status = "ok", overrides = {}) {
     return protocol.makeResult({ requestId: Request, publisherId: Publisher, expiresAt: Now + 300000,
         status, snapshot: snapshot(), error: "unavailable", now: Now, ...overrides });
 }
+
+test("legacy remote dollars require update only after payload and identity validation", () => {
+    const value = result();
+    const legacy = snapshot();
+    legacy.pricing.basis = "standard";
+    const encode = snapshot => {
+        const bytes = Buffer.from(JSON.stringify(snapshot));
+        return { encoding: "deflate-base64", bytes: bytes.length,
+            dataBase64: deflateSync(bytes).toString("base64") };
+    };
+    value.data = encode(legacy);
+    assert.deepEqual(protocol.validateResult(value, expected), { ok: false, reason: "update-required" });
+    assert.deepEqual(protocol.validateResult(value, { ...expected, machineId: Viewer }),
+        { ok: false, reason: "identity" });
+    value.data = encode({ ...legacy, messages: ["private"] });
+    assert.deepEqual(protocol.validateResult(value, expected), { ok: false, reason: "invalid" });
+});
+
+test("remote aggregation preserves estimated request counts and partial pricing coverage", () => {
+    const estimated = snapshot();
+    estimated.rows = [{ date: "2026-11-17", model: "claude-opus-5-5", requests: 2, inputTokens: 4231,
+        uncachedInputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 4231, outputTokens: 0,
+        usd: 0.021155, unpricedRequests: 1, estimatedRequests: 1 }];
+    estimated.coverage.warnings = ["1 次请求的缓存写入时长未完整覆盖，未知部分按 5 分钟价格估算。"];
+    const checked = protocol.validateResult(result("ok", { snapshot: estimated }), expected);
+    assert.equal(checked.ok, true);
+    assert.equal(checked.snapshot.rows[0].estimatedRequests, 1);
+    assert.equal(checked.snapshot.rows[0].unpricedRequests, 1);
+    assert.equal(checked.snapshot.rows[0].usd, 0.021155);
+    assert.deepEqual(checked.snapshot.coverage.warnings, estimated.coverage.warnings);
+});
 
 test("machine names are separate bounded metadata tied to current capabilities", () => {
     const identity = { machineId: Machine, publisherId: Publisher };

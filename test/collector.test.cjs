@@ -87,6 +87,48 @@ test('request aliases absorb fallback records but never merge distinct response 
     assert.ok(report.coverage.warnings.length);
 });
 
+test('prices cached raw events on demand and carries estimated request coverage without a cache migration', async t =>
+{
+    const fixture = await setup(t);
+    const partial = response('fallback');
+    partial.message.model = 'claude-opus-5-5';
+    partial.message.usage = { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 4231,
+        output_tokens: 0, cache_creation: { ephemeral_5m_input_tokens: 2706, ephemeral_1h_input_tokens: 0 } };
+    await fixture.write('main.jsonl', [partial, partial]);
+    const first = await fixture.collector.scan();
+    assert.equal(first.rows[0].usd, 0.021155);
+    assert.equal(first.rows[0].estimatedRequests, 1);
+    assert.equal(first.rows[0].unpricedRequests, 0);
+    assert.equal(first.rows[0].cacheWriteTokens, 4231);
+    assert.match(first.coverage.warnings.join(' '), /1.*5.*估算/);
+    const restarted = createCollector({ claudeHome: fixture.claudeHome, cacheDir: fixture.cacheDir,
+        now: () => Date.parse('2026-11-17T04:00:00Z') });
+    t.after(() => restarted.dispose());
+    const cached = await restarted.scan();
+    assert.equal(cached.coverage.cachedFiles, 1);
+    assert.equal(cached.coverage.parsedFiles, 0);
+    assert.deepEqual(cached.rows, first.rows);
+    assert.equal(cached.pricing.basis, 'claude-client-estimate');
+});
+
+test('invalid native TTL survives duplicate merging and disk cache reuse as unpriced writes', async t =>
+{
+    const fixture = await setup(t);
+    const invalid = response('same');
+    invalid.message.usage.cache_creation.ephemeral_5m_input_tokens = -1;
+    await fixture.write('main.jsonl', [response('same'), invalid]);
+    const first = await fixture.collector.scan();
+    assert.equal(first.rows[0].usd, 0.000422);
+    assert.equal(first.rows[0].unpricedRequests, 1);
+    assert.equal(first.rows[0].estimatedRequests, 0);
+    const restarted = createCollector({ claudeHome: fixture.claudeHome, cacheDir: fixture.cacheDir,
+        now: () => Date.parse('2026-11-17T04:00:00Z') });
+    t.after(() => restarted.dispose());
+    const cached = await restarted.scan();
+    assert.equal(cached.coverage.cachedFiles, 1);
+    assert.deepEqual(cached.rows, first.rows);
+});
+
 test('filters thirty Beijing calendar days after global response deduplication', async t =>
 {
     const fixture = await setup(t);

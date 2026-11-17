@@ -205,8 +205,13 @@ function createService({ claudeHome, dataDir, now = Date.now,
         try
         {
             const previous = await readJson(reportFile);
-            if (validateSnapshot(previous, { now: now() }).ok && previous.machineId === machineId)
-                state = { status: 'stale', snapshot: previous, progress: null };
+            const checked = validateSnapshot(previous, { now: now() });
+            if (previous.machineId === machineId)
+            {
+                if (checked.ok) state = { status: 'stale', snapshot: previous, progress: null };
+                else if (checked.reason === 'update-required')
+                    state = { status: 'unavailable', error: 'snapshot-update-required', progress: null };
+            }
         }
         catch { /* 缓存损坏时仅在查询时重新统计，不改写原始日志。 */ }
     })().catch(error =>

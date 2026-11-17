@@ -35,6 +35,9 @@ function normalizeUsage(value)
         cacheWriteTokens: count(usage.cache_creation_input_tokens), outputTokens: count(usage.output_tokens),
         cacheWrite5mTokens: count(cache.ephemeral_5m_input_tokens),
         cacheWrite1hTokens: count(cache.ephemeral_1h_input_tokens) };
+    if (usage.cache_creation != null && !isRecord(usage.cache_creation)
+        || ['ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens']
+            .some(key => cache[key] != null && !validTokens(cache[key]))) result.cacheWriteTtlInvalid = true;
     result.usageComplete = UsageFields.slice(0, 4).every(key => result[key] !== null);
     const total = (result.uncachedInputTokens ?? 0) + (result.cachedInputTokens ?? 0)
         + (result.cacheWriteTokens ?? 0);

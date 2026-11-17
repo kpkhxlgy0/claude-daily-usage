@@ -1,4 +1,4 @@
-# Standard API-equivalent pricing
+# Reference USD estimates
 
 Verified on 2026-11-17 against Anthropic's [pricing table](https://platform.claude.com/docs/en/about-claude/pricing).
 Amounts are USD per million tokens; columns are ordinary input / output / cache read:
@@ -34,10 +34,26 @@ provider identifier, or informal model-name inference is applied; unlisted IDs r
 [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) defines ordinary
 `input_tokens` separately from `cache_read_input_tokens` and `cache_creation_input_tokens`.
 Total input is their sum. Native `cache_creation.ephemeral_5m_input_tokens` costs 1.25x ordinary input;
-`ephemeral_1h_input_tokens` costs 2x. Their sum must match total cache creation. Unknown or inconsistent TTLs
-retain token counts while excluding those writes from USD and flagging incomplete pricing.
+`ephemeral_1h_input_tokens` costs 2x. Complete valid splits use these rates without an extra estimation marker.
 
-This is a dated Standard global API-equivalent estimate, independent of a subscription invoice. It does not infer
+Daily Usage 0.1.5 uses the `claude-client-estimate` basis dated 2026-11-17. Its cache-write fallback follows
+the arithmetic observed in the native Claude 2.1.326 client: reported one-hour writes use the one-hour price;
+total writes minus reported one-hour writes use the five-minute price. Missing buckets are treated as unknown,
+with zero known one-hour writes when that field is absent. When valid reported buckets do not cover total writes,
+the request and visible dollar amounts are marked estimated. For example, Opus 5.5 total writes 4231 with
+5m=2706 and 1h=0 produce $0.021155, while complete writes 1000 with 5m=600 and 1h=400 produce $0.0062.
+This is a local reference estimate, not evidence of subscription charging or included allowance weights.
+
+Negative, noninteger, nonfinite, malformed or overfilled split values retain token counts while excluding
+those writes from USD and flagging incomplete pricing. Invalid TTL metadata survives response merging and raw
+cache reuse. The raw cache version remains unchanged; old caches that already reduced invalid TTLs to null
+cannot distinguish them from missing TTLs, so those historical unknowns are estimated and labeled accordingly.
+
+This is a dated reference estimate using Standard global API rates, independent of a subscription invoice. It does not infer
 actual account billing, negotiated discounts, Fast/Batch/data-residency modifiers, or server-tool fees.
-Unknown models, missing usage, conflicting snapshots and unknown cache TTLs are visible coverage gaps;
+Unknown models, missing usage, conflicting snapshots and invalid cache TTLs are visible coverage gaps;
 USD includes only the supported token subtotal. Zero is never evidence that an unpriced request was free.
+
+Snapshots with the prior `standard` basis require both endpoints to update after full structural and size
+validation; malformed snapshots stay invalid. Saved dollar summaries are not reused. Raw parsed events remain
+cached and are repriced only by the next explicit on-demand query, with no startup scan or background polling.

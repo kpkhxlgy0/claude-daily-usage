@@ -24,7 +24,7 @@ function snapshot()
                 uncachedInputTokens: 100, cachedInputTokens: 0, cacheWriteTokens: 0,
                 outputTokens: 10, usd: 0, unpricedRequests: 1, estimatedRequests: 0 }
         ], coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard', asOf: '2026-11-16' } };
+        pricing: { basis: 'claude-client-estimate', asOf: '2026-11-17' } };
 }
 async function setup(t, getReport, extra = {})
 {
@@ -50,6 +50,29 @@ test('filters calendar dates and exposes unpriced requests instead of showing th
     assert.equal(root.querySelectorAll('tbody tr').length, 2);
     assert.match(root.querySelector('[data-coverage]').textContent, /1.*未定价/);
     assert.match(root.querySelector('tbody tr:last-child').textContent, /未定价/);
+});
+
+test('estimated cache writes are visible beside total and row dollars while unpriced gaps stay visible', async t =>
+{
+    const report = snapshot();
+    report.rows[0].estimatedRequests = 1;
+    report.rows[0].unpricedRequests = 1;
+    const { root } = await setup(t, async () => ({ status: 'ok', snapshot: report }));
+    assert.match(root.querySelector('[data-summary="usd"]').textContent, /1\.25.*含估算.*未定价部分/);
+    assert.match(root.querySelector('tbody tr td:last-child').textContent, /1\.25.*含估算.*未定价部分/);
+    assert.match(root.querySelector('[data-coverage]').textContent, /1.*缓存写入.*5.*估算/);
+    assert.match(root.querySelector('.daily-usage-card:nth-child(2) small').textContent, /费用估算（USD）/);
+    assert.match(root.querySelector('th:last-child').textContent, /费用估算（USD）/);
+    assert.match(root.querySelector('[data-price]').textContent, /订阅.*额度/);
+});
+
+test('complete TTL amounts have no fallback marker and legacy policy explains the required version', async t =>
+{
+    const { root } = await setup(t);
+    assert.doesNotMatch(root.querySelector('[data-summary="usd"]').textContent, /含估算/);
+    assert.doesNotMatch(root.querySelector('tbody tr td:last-child').textContent, /含估算/);
+    const unavailable = await setup(t, async () => ({ status: 'error', error: 'snapshot-update-required' }));
+    assert.match(unavailable.root.querySelector('[data-status]').textContent, /两端.*0\.1\.5/);
 });
 
 test('one query per open or explicit refresh, with no polling timers', async t =>

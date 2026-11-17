@@ -16,7 +16,7 @@ function snapshot(overrides = {}) {
             uncachedInputTokens: 70, cachedInputTokens: 20, cacheWriteTokens: 10, outputTokens: 30,
             usd: 0.001, unpricedRequests: 1, estimatedRequests: 0 }],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "standard", asOf: "2026-11-17", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
+        pricing: { basis: "claude-client-estimate", asOf: "2026-11-17", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
         ...overrides };
 }
 
@@ -27,6 +27,23 @@ test("accepts the shared snapshot contract without mutating it", () => {
     assert.equal(JSON.stringify(value), before);
     assert.equal(MaxSnapshotBytes, 2 * 1024 * 1024);
     assert.deepEqual(validateSnapshot(snapshot({ rows: [] }), { now: Now }), { ok: true });
+});
+
+test("only a structurally valid prior pricing basis requires an update", () => {
+    const legacy = snapshot();
+    legacy.pricing.basis = "standard";
+    assert.deepEqual(validateSnapshot(legacy, { now: Now }), { ok: false, reason: "update-required" });
+    const malformed = structuredClone(legacy);
+    malformed.rows[0].inputTokens++;
+    assert.deepEqual(validateSnapshot(malformed, { now: Now }), { ok: false, reason: "invalid" });
+    const oversized = structuredClone(legacy);
+    oversized.rows = Array.from({ length: 10000 }, (_, index) => ({ ...legacy.rows[0],
+        model: String(index).padStart(256, "x") }));
+    assert.deepEqual(validateSnapshot(oversized, { now: Now }), { ok: false, reason: "size" });
+    for (const change of [{ basis: "other" }, { asOf: "2026-01-01" }, { rawText: "private" }]) {
+        assert.deepEqual(validateSnapshot({ ...legacy, pricing: { ...legacy.pricing, ...change } }, { now: Now }),
+            { ok: false, reason: "invalid" });
+    }
 });
 
 test("stale snapshots remain valid while untrusted future snapshots are rejected", () => {

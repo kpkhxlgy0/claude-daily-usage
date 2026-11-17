@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createRemoteAdapter } = require('../src/remote-adapter.cjs');
 const { createTransport } = require('../src/remote-transport.cjs');
+const { deflateSync } = require('node:zlib');
 const p = require('../src/remote-protocol.cjs');
 
 const Identity = { machineId: '11111111-1111-4111-8111-111111111111',
@@ -40,7 +41,7 @@ function snapshot(revision = 1)
     return { schemaVersion: 1, source: 'com.kpk.daily-usage', ...Identity, revision, generatedAt: Time,
         timezone: 'Asia/Shanghai', from: '2026-11-17', to: '2026-11-17', rows: [],
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard', asOf: '2026-11-17', source: 'fixture' } };
+        pricing: { basis: 'claude-client-estimate', asOf: '2026-11-17', source: 'fixture' } };
 }
 function hub()
 {
@@ -409,6 +410,28 @@ test('replay signals never rescan a completed or cancelled request', async t =>
     for (let index = 0; index < 5; index++) f.network.emit({ requestId: sent.requestId, kind: 'query', ok: true });
     await flush(); await flush();
     assert.equal(f.queries.length, 1);
+});
+
+test('legacy remote pricing requires both ends to update without accepting old dollar totals', async t =>
+{
+    const f = fixture(t);
+    await f.runner.ready;
+    await f.viewer.discover(f.frame);
+    const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+    await until(() => f.queries.length === 1);
+    f.network.hold(true);
+    f.queries[0].resolve({ status: 'ok', snapshot: snapshot() });
+    await until(() => f.network.held.some(value => value.kind === 'result'));
+    const key = Object.keys(f.network.metadata).find(key => key.startsWith(p.CapsKey + '_result_'));
+    const legacy = snapshot();
+    legacy.pricing.basis = 'standard';
+    const bytes = Buffer.from(JSON.stringify(legacy));
+    f.network.metadata[key].data = { encoding: 'deflate-base64', bytes: bytes.length,
+        dataBase64: deflateSync(bytes).toString('base64') };
+    f.network.release();
+    const rejected = await request;
+    assert.equal(rejected.error, 'snapshot-update-required');
+    assert.equal(rejected.snapshot, undefined);
 });
 
 test('caps identity drift and older snapshots preserve the prior successful timestamp', async t =>

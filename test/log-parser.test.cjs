@@ -24,6 +24,24 @@ test('normalizes Claude ordinary input as exclusive of cache tokens', () =>
     assert.equal(normalizeUsage(null).usageComplete, false);
 });
 
+test('preserves an invalid TTL marker while absent buckets remain eligible for estimation', () =>
+{
+    for (const invalid of [-1, 0.5, Infinity, NaN, '4', false])
+    {
+        const usage = row().message.usage;
+        usage.cache_creation.ephemeral_5m_input_tokens = invalid;
+        const normalized = normalizeUsage(usage);
+        assert.equal(normalized.cacheWriteTtlInvalid, true);
+        assert.equal(normalized.usageComplete, true);
+        assert.equal(normalized.cacheWrite5mTokens, null);
+    }
+    const usage = row().message.usage;
+    delete usage.cache_creation;
+    assert.notEqual(normalizeUsage(usage).cacheWriteTtlInvalid, true);
+    for (const cache_creation of ['invalid', [], 1, false])
+        assert.equal(normalizeUsage({ ...usage, cache_creation }).cacheWriteTtlInvalid, true);
+});
+
 test('streams split UTF8 buffers, includes subagents and emits sanitized metadata only', () =>
 {
     const parser = createLogParser({ sourceId: 'file-1' });
