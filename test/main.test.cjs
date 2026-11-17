@@ -63,6 +63,7 @@ test('startup registers event queries but does no scan or remote work', async t 
     const hosts = await f.invoke('hosts', frame());
     assert.equal(hosts.length, 1);
     assert.equal(hosts[0].hostId, 'local');
+    assert.equal(hosts[0].label, '本机');
 });
 
 test('pending queries use pushed replies and retain ownership until completion', async t =>
@@ -166,13 +167,19 @@ test('remote adapter receives only explicit discovery and owned requests; unknow
 {
     const calls = [];
     let disposed = 0;
-    const remote = { getHosts: () => [{ hostId: 'runner-1', label: 'Runner', raw: 'private' }],
+    const candidates = [{ hostId: 'runner-1', label: 'Runner', raw: 'private' }];
+    const remote = { getHosts: () => candidates,
         discover: async owner => { calls.push(['discover', owner]); },
         query: async (hostId, options) => { calls.push(['query', hostId, options]); return { status: 'ok' }; },
         dispose() { disposed++; } };
     const f = fixture(t, remote);
     const owner = frame();
-    assert.deepEqual((await f.invoke('hosts', owner))[1], { hostId: 'runner-1', label: 'Runner' });
+    assert.deepEqual((await f.invoke('hosts', owner))[1], { hostId: 'runner-1', label: '远程' });
+    candidates.push({ hostId: 'runner-1', label: 'Duplicate' }, { hostId: 'invalid\n', label: 'Invalid' });
+    assert.equal((await f.invoke('hosts', owner))[1].label, '远程');
+    candidates.push({ hostId: 'runner-2', label: 'Other' });
+    assert.deepEqual(await f.invoke('hosts', owner), [{ hostId: 'local', label: '本机' },
+        { hostId: 'runner-1', label: 'Runner' }, { hostId: 'runner-2', label: 'Other' }]);
     await f.invoke('discover', owner);
     f.send('query', owner, { hostId: 'runner-1', requestId: RequestId });
     await flush();
@@ -226,7 +233,7 @@ test('host-name demand is cancellable per frame and never starts a collector', a
     assert.equal(calls[1].signal.aborted, false);
     calls[0].resolve(); calls[1].resolve();
     assert.equal(await a, null);
-    assert.equal((await b)[1].label, '远程 · 工作电脑');
+    assert.equal((await b)[1].label, '远程');
     assert.equal(two.sender.window.listenerCount('hide'), 0);
 });
 

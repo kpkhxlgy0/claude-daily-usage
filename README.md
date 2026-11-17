@@ -1,14 +1,14 @@
 # Daily Usage for Claude++
 
 独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 Standard API 等值美元。
-按机器、日期和模型拆分，包含子代理。版本 0.1.3；需要 Windows、Claude++ 0.3.11 或更新版本。
+按机器、日期和模型拆分，包含子代理。版本 0.1.4；需要 Windows、Claude++ 0.3.11 或更新版本。
 无需安装或启用 Session Stats。
 
 ## 安装和使用
 
 在 **Claude++ Settings → Tweak Store** 搜索 **Daily Usage** 安装，随后打开设置中的 **Daily Usage** 页面。
-运行时无 npm 依赖。也可以从 [v0.1.3 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.3)
-下载 `claude-daily-usage-0.1.3.zip`，解压到长期保留的目录，在 PowerShell7 运行：
+运行时无 npm 依赖。也可以从 [v0.1.4 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.4)
+下载 `claude-daily-usage-0.1.4.zip`，解压到长期保留的目录，在 PowerShell7 运行：
 
 ```powershell
 pwsh -File .\Inject-ClaudePlusPlus.ps1 -CheckOnly
@@ -16,7 +16,8 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 ```
 
 本机默认选中。要查看远程机器，先在当前窗口打开该机器上的 Remote Control 会话，再打开 Daily Usage。
-两端更新至 0.1.3 后，远程入口优先显示运行电脑的主机名；离线保留上次名称，未识别时显示会话 ID。
+机器下拉框中本机只显示“本机”，只有一个远程入口时只显示“远程”；多个远程入口时显示名称以便区分。
+两端更新至 0.1.3 或更高版本后可识别运行电脑的主机名；离线保留上次名称，未识别时显示会话 ID。
 每个入口读取对应运行机器的全机汇总，同机多个会话可能显示多个入口。新旧版本混用时统计查询仍可使用。
 **查看端和运行端都必须安装并启用此 tweak，运行端 Claude++ 应用需要保持运行。** 无需在运行端打开统计页。
 

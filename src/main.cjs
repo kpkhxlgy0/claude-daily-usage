@@ -179,7 +179,7 @@ function startMain(api, dependencies = {})
             }
             if (controller.signal.aborted) return null;
         }
-        const hosts = [{ hostId: 'local', label: `本机 · ${os.hostname()}` }];
+        const hosts = [{ hostId: 'local', label: '本机' }];
         let candidates;
         try { candidates = await remote?.getHosts?.(context.frame); }
         catch { return hosts; }
@@ -191,6 +191,7 @@ function startMain(api, dependencies = {})
             hosts.push({ hostId: candidate.hostId,
                 label: concise(candidate.label) ? candidate.label : `远程 · ${candidate.hostId}` });
         }
+        if (hosts.length === 2) hosts[1].label = '远程';
         return hosts;
     });
     handle('discover', async context =>
