@@ -3,8 +3,9 @@
 const { randomUUID } = require("node:crypto");
 const { inflateSync } = require("node:zlib");
 const { MaxSnapshotBytes, normalizeThreadId } = require("./protocol.cjs");
-const { signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey, MachineKey,
-    validateCapabilities, validateMachine, validateMarker, validateResult } = require("./remote-protocol.cjs");
+const { signalId, parseSignalId, normalizeBridgeId, validBinding, resultKey, CapsKey, MachineKey,
+    CapabilitiesV2Key, WeeklySnapshotVersion, supportsWeeklySnapshots, validateCapabilities, validateMachine,
+    validateMarker, validateResult } = require("./remote-protocol.cjs");
 
 const MaxBodyBytes = 1024 * 1024;
 const MaxFrameChars = 64 * 1024;
@@ -23,23 +24,23 @@ function cancelBody(response) {
 
 function ownedKey(key) {
     if (key === CapsKey) return { kind: "caps" };
+    if (key === CapabilitiesV2Key) return { kind: "caps-v2" };
     if (key === MachineKey) return { kind: "machine" };
     const match = /^claudepp_daily_usage_(request|result)_([0-9a-f-]{36})$/.exec(key);
     const parsed = match && match[0] === key && parseSignalId(match[2]);
     return parsed?.kind === "query" ? { kind: match[1], requestId: parsed.requestId } : null;
 }
 
-function validOwnedValue(key, value, binding) {
+function validOwnedValue(key, value, binding, snapshotVersion = WeeklySnapshotVersion, machineId) {
     const owned = ownedKey(key);
     if (!owned) return false;
-    if (owned.kind === "caps") return validateCapabilities(value).ok;
+    if (owned.kind === "caps" || owned.kind === "caps-v2") return validateCapabilities(value).ok;
     if (owned.kind === "machine") return record(value) && validateMachine(value, {
         source: value.source, schemaVersion: value.schemaVersion, demandVersion: value.demandVersion,
         machineId: value.machineId, publisherId: value.publisherId }).ok;
     if (!record(value) || value.requestId !== owned.requestId) return false;
     if (owned.kind === "request") return validateMarker(value, { binding, now: value.requestedAt }).ok;
-    let machineId;
-    if (value.status === "ok") {
+    if (value.status === "ok" && !machineId) {
         const data = value.data;
         if (!record(data) || typeof data.dataBase64 !== "string" || data.dataBase64.length > 87384) return false;
         try {
@@ -48,12 +49,13 @@ function validOwnedValue(key, value, binding) {
         } catch { return false; }
     }
     return validateResult(value, { requestId: owned.requestId, publisherId: value.publisherId,
-        machineId, now: value.updatedAt }).ok;
+        machineId, snapshotVersion, now: value.updatedAt }).ok;
 }
 
 function validateOperations(operations, binding) {
     if (!Array.isArray(operations) || operations.length < 2 || operations.length > 32) return false;
     let root;
+    let advertisedCaps;
     const compared = new Map();
     const reserved = new Set();
     if (operations.length === 3 && operations[0]?.op === "test" && operations[0].path === ""
@@ -65,7 +67,13 @@ function validateOperations(operations, binding) {
         if (marker && result && marker.value?.action === "query" && validOwnedValue(marker.path.slice(1), marker.value, binding)
             && ownedKey(result.path.slice(1)).requestId === marker.value.requestId
             && !Object.hasOwn(operations[0].value, marker.path.slice(1))
-            && !Object.hasOwn(operations[0].value, result.path.slice(1))) reserved.add(result.path.slice(1));
+            && !Object.hasOwn(operations[0].value, result.path.slice(1))) {
+            const capabilities = operations[0].value[CapsKey];
+            if (marker.value.snapshotVersion === WeeklySnapshotVersion
+                && (marker.value.publisherId !== capabilities?.publisherId
+                    || !supportsWeeklySnapshots(operations[0].value[CapabilitiesV2Key], capabilities))) return false;
+            reserved.add(result.path.slice(1));
+        }
     }
     let mutations = 0;
     for (const operation of operations) {
@@ -89,12 +97,24 @@ function validateOperations(operations, binding) {
         }
         if (!compared.has(key) && root === undefined) return false;
         if (root && Object.hasOwn(root, key) && !validOwnedValue(key, root[key], binding)) return false;
-        if (operation.op !== "remove" && !(operation.value === null && reserved.has(key))
-            && !validOwnedValue(key, operation.value, binding)) return false;
+        let snapshotVersion = WeeklySnapshotVersion;
+        let machineId;
         if (owned.kind === "result" && compared.has(key) && compared.get(key) === null && operation.op !== "remove") {
             const marker = compared.get(markerKey), caps = compared.get(CapsKey);
             if (!marker || marker.action !== "query" || !caps || caps.publisherId !== marker.publisherId
                 || operation.value?.publisherId !== marker.publisherId) return false;
+            if (marker.snapshotVersion !== WeeklySnapshotVersion
+                || !supportsWeeklySnapshots(compared.get(CapabilitiesV2Key), caps)) snapshotVersion = 1;
+            machineId = caps.machineId;
+        }
+        if (operation.op !== "remove" && !(operation.value === null && reserved.has(key))) {
+            if (!validOwnedValue(key, operation.value, binding, snapshotVersion, machineId)) return false;
+            if (owned.kind === "request" && operation.value.snapshotVersion === WeeklySnapshotVersion
+                && operation.value.action === "query" && !reserved.has(resultKey(owned.requestId))) return false;
+            if (owned.kind === "caps") advertisedCaps = operation.value;
+            if (owned.kind === "caps-v2"
+                && !supportsWeeklySnapshots(operation.value, advertisedCaps ?? compared.get(CapsKey) ?? root?.[CapsKey]))
+                return false;
         }
         mutations++;
     }

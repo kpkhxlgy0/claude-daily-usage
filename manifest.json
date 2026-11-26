@@ -1,11 +1,11 @@
 {
   "id": "com.kpk.daily-usage",
   "name": "Daily Usage",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "githubRepo": "kpkhxlgy0/claude-daily-usage",
   "homepage": "https://github.com/kpkhxlgy0/claude-daily-usage",
   "iconUrl": "./icon.svg",
-  "description": "按北京时间统计本机和 Remote Control 机器的每日 Token 与费用估算（USD）。",
+  "description": "按北京时间查看本机和 Remote Control 机器的每日 Token、费用估算（USD）和本轮周额度。",
   "author": "kpkhxlgy0",
   "scope": "both",
   "main": "index.js",

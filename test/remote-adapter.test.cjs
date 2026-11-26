@@ -11,6 +11,7 @@ const Identity = { machineId: '11111111-1111-4111-8111-111111111111',
 const Binding = { bridgeSessionId: 'session_fixture', organizationId: '33333333-3333-4333-8333-333333333333',
     accountId: '44444444-4444-4444-8444-444444444444' };
 const Time = Date.UTC(2026, 10, 17);
+const V2Key = 'claudepp_daily_usage_capabilities_v2';
 const hostId = binding => `${binding.organizationId}:${binding.bridgeSessionId}`;
 const copy = value => JSON.parse(JSON.stringify(value));
 function reordered(value)
@@ -42,6 +43,12 @@ function snapshot(revision = 1)
         timezone: 'Asia/Shanghai', from: '2026-11-17', to: '2026-11-17', rows: [],
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
         pricing: { basis: 'claude-client-estimate', asOf: '2026-11-17', source: 'fixture' } };
+}
+function weeklySnapshot()
+{
+    return { ...snapshot(), schemaVersion: 2, weekly: { startAt: Time - 1000, startKind: 'reset',
+        fullAt: null, sampleAt: Time, usedPercent: 12, rows: [{ model: 'claude-opus-4-8',
+            requests: 1, baseUsd: 0.2, usd: 0.3, unpricedRequests: 0, estimatedRequests: 0 }] } };
 }
 function hub()
 {
@@ -268,7 +275,7 @@ test('end-to-end demand watches before writes, lazily scans once, and has zero i
     assert.equal(result.status, 'ok', JSON.stringify(result));
     assert.deepEqual(result.snapshot, snapshot());
     assert.deepEqual(f.network.metadata.unrelated, { preserve: true });
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey, V2Key].sort());
     const calls = f.network.calls.filter(value => value.name === 'viewer');
     const watch = calls.findIndex(value => value.kind === 'watch');
     const write = calls.findIndex(value => value.kind === 'patch');
@@ -277,6 +284,66 @@ test('end-to-end demand watches before writes, lazily scans once, and has zero i
     const final = f.network.calls.length;
     await flush(); await flush();
     assert.equal(f.network.calls.length, final);
+});
+
+test('a matching new remote advertises and returns the weekly snapshot through the native bridge', async t =>
+{
+    const f = fixture(t, { realTransport: true });
+    await f.runner.ready;
+    assert.deepEqual(f.network.metadata[V2Key], p.makeCapabilities(Identity));
+    await f.viewer.discover(f.frame);
+    const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+    await until(() => f.queries.length === 1);
+    const marker = Object.values(f.network.metadata).find(value => value?.action === 'query');
+    assert.equal(marker.snapshotVersion, 2);
+    f.queries[0].resolve({ status: 'ok', snapshot: weeklySnapshot() });
+    assert.deepEqual(await request, { status: 'ok', snapshot: weeklySnapshot(), progress: null });
+    assert.equal(Object.hasOwn(f.network.metadata, p.requestKey(marker.requestId)), false);
+    assert.equal(Object.hasOwn(f.network.metadata, p.resultKey(marker.requestId)), false);
+});
+
+test('a legacy query gets the original daily snapshot shape from a weekly-capable runner', async t =>
+{
+    const f = fixture(t, { realTransport: true });
+    const old = createTransport({ fetch: f.network.fetch('old'), now: () => Time });
+    t.after(() => old.dispose());
+    await f.runner.ready;
+    const watch = await old.watch(Binding);
+    const { metadata } = await old.get(Binding);
+    const id = p.createRequestId();
+    const marker = p.makeMarker({ requestId: id, publisherId: Identity.publisherId,
+        viewerId: Binding.accountId, binding: Binding, now: Time });
+    assert.equal(Object.hasOwn(marker, 'snapshotVersion'), false);
+    await old.patch(Binding, [{ op: 'test', path: '', value: metadata },
+        { op: 'add', path: '/' + p.requestKey(id), value: marker },
+        { op: 'add', path: '/' + p.resultKey(id), value: null }]);
+    await old.notify(Binding, id, 'query');
+    await until(() => f.queries.length === 1);
+    f.queries[0].resolve({ status: 'ok', snapshot: weeklySnapshot() });
+    assert.equal((await watch.next()).kind, 'query');
+    assert.equal((await watch.next()).kind, 'result');
+    const { metadata: returned } = await old.get(Binding);
+    const result = p.validateResult(returned[p.resultKey(id)], { requestId: id, now: Time, ...Identity });
+    assert.deepEqual(result, { ok: true, snapshot: snapshot() });
+});
+
+test('a new viewer sends the legacy marker when v2 capability is absent or belongs to another publisher', async t =>
+{
+    for (const stale of [false, true])
+    {
+        const f = fixture(t, { realTransport: true });
+        await f.runner.ready;
+        delete f.network.metadata[V2Key];
+        if (stale) f.network.metadata[V2Key] = p.makeCapabilities({ ...Identity, publisherId: Binding.accountId });
+        await f.viewer.discover(f.frame);
+        const request = f.viewer.query(hostId(Binding), { frame: f.frame });
+        await until(() => f.queries.length === 1);
+        const marker = Object.values(f.network.metadata).find(value => value?.action === 'query');
+        assert.deepEqual(marker, p.makeMarker({ ...marker, binding: Binding, now: Time }));
+        assert.equal(Object.hasOwn(marker, 'snapshotVersion'), false);
+        f.queries[0].resolve({ status: 'ok', snapshot: snapshot() });
+        assert.deepEqual(await request, { status: 'ok', snapshot: snapshot(), progress: null });
+    }
 });
 
 test('POST acceptance retains result until delayed native signal and one viewer GET', async t =>
@@ -390,7 +457,7 @@ test('actual transport and native SSE support concurrent viewers with one bounde
     assert.equal(f.queries[1].signal.aborted, false);
     f.queries[1].resolve({ status: 'ok', snapshot: snapshot() });
     assert.equal((await second).status, 'ok');
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey, V2Key].sort());
     const idle = f.network.calls.length;
     await flush(); await flush();
     assert.equal(f.network.calls.length, idle);
@@ -539,7 +606,7 @@ test('failed query notification cancels its reservation without retry or collect
     assert.equal(value.error, 'transport');
     assert.equal(f.queries.length, 0);
     assert.equal(f.network.calls.filter(call => call.eventKind === 'query').length, 1);
-    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey].sort());
+    assert.deepEqual(Object.keys(f.network.metadata).sort(), ['unrelated', p.CapsKey, p.MachineKey, V2Key].sort());
 });
 
 test('matching unsupported native response fails promptly and late foreign results cannot replace state', async t =>
@@ -583,7 +650,7 @@ test('native metadata object key reordering preserves identity and unchanged rep
     assert.equal((await request).error, 'snapshot-replay', 'same revision with changed data remains invalid');
 });
 
-test('runner advertises the hostname in its existing PATCH and cleans up only its own name', async t =>
+test('runner advertises hostname and v2 in its existing PATCH and cleans up only owned metadata', async t =>
 {
     const f = fixture(t, { realTransport: true });
     await f.runner.ready;
@@ -591,11 +658,14 @@ test('runner advertises the hostname in its existing PATCH and cleans up only it
     const patches = f.network.calls.filter(call => call.name === 'runner' && call.kind === 'patch');
     assert.equal(patches.length, 1);
     assert.deepEqual(patches[0].operations.filter(op => op.op === 'add').map(op => op.path).sort(),
-        ['/claudepp_daily_usage', '/claudepp_daily_usage_machine']);
+        ['/claudepp_daily_usage', '/' + V2Key, '/claudepp_daily_usage_machine']);
     const foreign = p.makeMachine({ ...Identity, publisherId: Binding.accountId }, 'Replacement-PC');
     f.network.metadata[p.MachineKey] = foreign;
+    const foreignCaps = p.makeCapabilities(foreign);
+    f.network.metadata[V2Key] = foreignCaps;
     await f.runner.dispose();
-    assert.deepEqual(f.network.metadata, { unrelated: { preserve: true }, [p.MachineKey]: foreign });
+    assert.deepEqual(f.network.metadata, { unrelated: { preserve: true }, [p.MachineKey]: foreign,
+        [V2Key]: foreignCaps });
 });
 
 test('host name demand uses one GET, no collector or watch, and has zero idle traffic', async t =>

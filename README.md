@@ -1,14 +1,14 @@
 # Daily Usage for Claude++
 
-独立的 Claude++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和费用估算（USD）。
-按机器、日期和模型拆分，包含子代理。版本 0.1.5；需要 Windows、Claude++ 0.3.11 或更新版本。
+独立的 Claude++ tweak，可查看今天、最近 7 天、最近 30 天和本轮周额度的用量。时间均为北京时间。
+按机器和模型拆分，包含子代理。版本 0.2.0；需要 Windows、Claude++ 0.3.11 或更新版本。
 无需安装或启用 Session Stats。
 
 ## 安装和使用
 
 在 **Claude++ Settings → Tweak Store** 搜索 **Daily Usage** 安装，随后打开设置中的 **Daily Usage** 页面。
-运行时无 npm 依赖。也可以从 [v0.1.5 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.1.5)
-下载 `claude-daily-usage-0.1.5.zip`，解压到长期保留的目录，在 PowerShell7 运行：
+运行时无 npm 依赖。也可以从 [v0.2.0 Release](https://github.com/kpkhxlgy0/claude-daily-usage/releases/tag/v0.2.0)
+下载 `claude-daily-usage-0.2.0.zip`，解压到长期保留的目录，在 PowerShell7 运行：
 
 ```powershell
 pwsh -File .\Inject-ClaudePlusPlus.ps1 -CheckOnly
@@ -38,6 +38,17 @@ pwsh -File .\Inject-ClaudePlusPlus.ps1
 保留源码、统计缓存、Store 安装副本及其他 tweaks；不会自动退出或重启 Claude。
 
 ## 数字表示什么
+
+### 本轮周额度
+
+在时间下拉框选择「本轮周额度」。运行端从 Claude Desktop 的实际用户数据目录读取 `plan-usage-history.json`，采用全模型周额度采样。该历史保存使用百分比和采样时间。界面将可确认的本轮首个采样标为「自首次观测」，并显示最近一次观测时间；跨组织或无法判定本轮时显示「—」。
+
+从观测起点起，未满额时累计到本次查询，首次观测到 100% 后固定截止时刻。机器列表中的每一项独立读取本机保留的 Code 请求，按去重后的响应时间计算各模型金额。网页及其他设备也可能消耗账户额度。
+两端均需更新至 0.2.0 或更高版本，连接组织与运行端采样一致时才传周汇总。与 0.1.5 配合时仍可查询原有日期视图。
+
+「基础价」和「含长上下文」均区分普通输入、输出、缓存读取和 5 分钟/1 小时写入。后者额外应用该模型的长上下文价格，例如 Haiku 5.5 的 100,000 输入 token 阶梯。模型按含长上下文的美元金额排序，金额占比按已定价部分计算。
+
+### 按日期统计
 
 - 来源为运行机器 `CLAUDE_CONFIG_DIR/projects/**/*.jsonl`，未设置时使用 `~/.claude/projects`，包含子代理目录。
   只统计该用户配置目录保留的 Claude Code / Desktop Code 日志；不包含未落地的普通云端聊天或已删除历史。
@@ -107,6 +118,7 @@ node scripts/report.cjs
 
 可用 `--home PATH` 指定 Claude 配置目录、`--cache PATH` 指定缓存位置；默认 CLI 缓存写入
 `<Claude 配置目录>/.daily-usage/cache`。命令结束后不保留后台任务。
+命令行要包含周额度时，另传 `--desktop-data PATH`，指向运行端实际含有 `plan-usage-history.json` 的 Claude Desktop 用户数据目录。
 
 源码：[kpkhxlgy0/claude-daily-usage](https://github.com/kpkhxlgy0/claude-daily-usage)。
 MIT；复用来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

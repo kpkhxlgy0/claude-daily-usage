@@ -67,7 +67,7 @@ function abortError()
     return Object.assign(new Error('Daily Usage query cancelled'), { name: 'AbortError', code: 'ABORT_ERR' });
 }
 
-function createService({ claudeHome, dataDir, now = Date.now,
+function createService({ claudeHome, claudeData, dataDir, now = Date.now,
     workerFactory = options => new Worker(path.join(__dirname, 'worker.cjs'), options) })
 {
     const directory = path.join(claudeHome, '.daily-usage');
@@ -82,6 +82,7 @@ function createService({ claudeHome, dataDir, now = Date.now,
     let current;
     let initializationError;
     let state = { status: 'unavailable', progress: null };
+    let snapshotOrganizationId;
     let publishing = Promise.resolve();
     let disposal;
 
@@ -95,6 +96,13 @@ function createService({ claudeHome, dataDir, now = Date.now,
     }
 
     const active = job => !stopped && current === job && job.subscribers.size > 0;
+
+    function subscriberState({ organizationId })
+    {
+        if (organizationId === undefined || !state.snapshot?.weekly
+            || organizationId !== null && organizationId === snapshotOrganizationId) return state;
+        return { ...state, snapshot: { ...state.snapshot, weekly: null } };
+    }
 
     function settle(subscriber, error, value)
     {
@@ -115,7 +123,7 @@ function createService({ claudeHome, dataDir, now = Date.now,
         terminate(job);
     }
 
-    async function complete(job, error, snapshot)
+    async function complete(job, error, snapshot, weeklyOrganizationId)
     {
         if (!active(job)) return;
         await terminate(job);
@@ -127,8 +135,9 @@ function createService({ claudeHome, dataDir, now = Date.now,
         {
             revision++;
             state = { status: 'ok', snapshot, progress: null };
+            snapshotOrganizationId = normalizeThreadId(weeklyOrganizationId);
         }
-        for (const subscriber of job.subscribers) settle(subscriber, null, state);
+        for (const subscriber of job.subscribers) settle(subscriber, null, subscriberState(subscriber));
         job.subscribers.clear();
     }
 
@@ -138,7 +147,8 @@ function createService({ claudeHome, dataDir, now = Date.now,
         state = { ...state, status: 'loading', error: null, progress: null };
         try
         {
-            job.worker = workerFactory({ workerData: { claudeHome, cacheDir: path.join(dataDir, 'cache') } });
+            job.worker = workerFactory({ workerData: { claudeHome, cacheDir: path.join(dataDir, 'cache'),
+                ...(claudeData ? { claudeData } : {}) } });
             job.worker.on('message', message =>
             {
                 if (!active(job) || job.finished) return;
@@ -154,13 +164,13 @@ function createService({ claudeHome, dataDir, now = Date.now,
                     publishing = publishing.then(async () =>
                     {
                         if (!active(job)) return;
-                        const snapshot = { ...message.report, schemaVersion: 1, source: 'com.kpk.daily-usage',
+                        const snapshot = { weekly: null, ...message.report, schemaVersion: 2, source: 'com.kpk.daily-usage',
                             machineId, publisherId, revision: revision + 1 };
                         if (!validateSnapshot(snapshot, { now: now() }).ok
                             || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)
                             throw new Error('invalid-report');
                         await atomicWrite(reportFile, snapshot, () => active(job), job.controller.signal);
-                        await complete(job, null, snapshot);
+                        await complete(job, null, snapshot, message.weeklyOrganizationId);
                     }).catch(error => complete(job, error));
                 }
             });
@@ -224,12 +234,13 @@ function createService({ claudeHome, dataDir, now = Date.now,
         ready,
         getIdentity: () => machineId ? { machineId, publisherId } : null,
         getState: () => state,
-        query({ signal } = {})
+        query({ signal, organizationId } = {})
         {
             if (stopped || signal?.aborted) return Promise.reject(abortError());
             return new Promise((resolve, reject) =>
             {
-                const subscriber = { resolve, reject, signal };
+                const subscriber = { resolve, reject, signal,
+                    organizationId: organizationId === undefined ? undefined : normalizeThreadId(organizationId) };
                 subscriber.abort = () =>
                 {
                     settle(subscriber, abortError());
@@ -244,7 +255,7 @@ function createService({ claudeHome, dataDir, now = Date.now,
                 {
                     if (subscriber.settled) return;
                     if (stopped || signal?.aborted) return subscriber.abort();
-                    if (initializationError) return settle(subscriber, null, state);
+                    if (initializationError) return settle(subscriber, null, subscriberState(subscriber));
                     const job = current || { subscribers: new Set() };
                     subscriber.job = job;
                     job.subscribers.add(subscriber);

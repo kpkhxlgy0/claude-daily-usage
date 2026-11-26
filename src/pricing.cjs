@@ -35,7 +35,7 @@ function validTokens(value)
 
 function priceRequest({ model, inputTokens, uncachedInputTokens, cachedInputTokens = 0,
     cacheWriteTokens = 0, cacheWrite5mTokens, cacheWrite1hTokens, cacheWriteTtlInvalid = false,
-    outputTokens, usageComplete = true } = {})
+    outputTokens, usageComplete = true } = {}, { baseRates = false } = {})
 {
     if (![inputTokens, uncachedInputTokens, cachedInputTokens, cacheWriteTokens, outputTokens].every(validTokens)
         || inputTokens !== uncachedInputTokens + cachedInputTokens + cacheWriteTokens)
@@ -46,7 +46,7 @@ function priceRequest({ model, inputTokens, uncachedInputTokens, cachedInputToke
     const rate = Rates.get(model);
     if (!rate) return { usd: 0, unpriced: true, estimated: false, uncachedInputTokens, reasons: ['unknown-model'] };
     let [inputRate, outputRate, cachedRate] = rate;
-    if (model === 'claude-haiku-5-5' && inputTokens > HaikuLongContextInput)
+    if (!baseRates && model === 'claude-haiku-5-5' && inputTokens > HaikuLongContextInput)
     {
         inputRate *= 5;
         outputRate *= 5;

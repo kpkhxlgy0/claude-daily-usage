@@ -8,7 +8,7 @@ parentPort.once('message', async message =>
 {
     try
     {
-        if (message?.type === 'scan') parentPort.postMessage({ type: 'result', report: await collector.scan() });
+        if (message?.type === 'scan') parentPort.postMessage({ type: 'result', ...await collector.scanWithContext() });
     }
     catch (error) { parentPort.postMessage({ type: 'error', error: error.code || 'collector-failed' }); }
     finally

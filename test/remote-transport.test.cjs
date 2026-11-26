@@ -3,7 +3,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createTransport } = require("../src/remote-transport.cjs");
-const { makeMarker, makeCapabilities, requestKey } = require("../src/remote-protocol.cjs");
+const { makeMarker, makeCapabilities, makeResult, requestKey, resultKey, CapsKey, CapabilitiesV2Key } =
+    require("../src/remote-protocol.cjs");
 
 const Now = 1794873600000;
 const Request = "d411ea01-1111-4111-8111-111111111111";
@@ -153,6 +154,38 @@ test("result reservation is atomic with its absent query marker and result write
     await f.transport.patch(binding, [{ op: "test", path: "/" + key, value: marker() },
         { op: "test", path: "/claudepp_daily_usage", value: caps() },
         { op: "test", path: "/" + result, value: null }, { op: "remove", path: "/" + result }]);
+});
+
+test("weekly negotiation rejects unbound capabilities and weekly results for another machine", async t => {
+    const f = fixture(); t.after(() => f.transport.dispose());
+    const own = caps();
+    const foreign = makeCapabilities({ machineId: Organization, publisherId: Publisher });
+    const weeklyMarker = makeMarker({ ...marker(), binding, now: Now, snapshotVersion: 2 });
+    const request = "/" + requestKey(Request), result = "/" + resultKey(Request);
+    const root = value => ({ op: "test", path: "", value });
+    const version2 = "/" + CapabilitiesV2Key;
+    const reserve = value => [root(value), { op: "add", path: request, value: weeklyMarker },
+        { op: "add", path: result, value: null }];
+    const snapshot = { source: "com.kpk.daily-usage", schemaVersion: 2, machineId: Organization,
+        publisherId: Publisher, revision: 1, generatedAt: Now, timezone: "Asia/Shanghai",
+        from: "2026-11-17", to: "2026-11-17", rows: [], weekly: null,
+        coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
+        pricing: { basis: "claude-client-estimate", asOf: "2026-11-17", source: "fixture" } };
+    const publish = resultSnapshot => [{ op: "test", path: request, value: weeklyMarker },
+        { op: "test", path: "/" + CapsKey, value: own }, { op: "test", path: version2, value: own },
+        { op: "test", path: result, value: null }, { op: "replace", path: result, value: makeResult({
+            requestId: Request, publisherId: Publisher, expiresAt: Now + 300000, status: "ok",
+            now: Now, snapshotVersion: 2, snapshot: resultSnapshot }) }];
+    for (const operations of [
+        [root({ [CapsKey]: own }), { op: "add", path: version2, value: foreign }],
+        reserve({ [CapsKey]: own }), reserve({ [CapsKey]: own, [CapabilitiesV2Key]: foreign }),
+        reserve({ [CapsKey]: own, [CapabilitiesV2Key]: own }).slice(0, 2),
+        publish(snapshot),
+    ]) await assert.rejects(f.transport.patch(binding, operations), { code: "invalid" });
+    assert.equal(f.calls.length, 0);
+    await f.transport.patch(binding, reserve({ [CapsKey]: own, [CapabilitiesV2Key]: own }));
+    await f.transport.patch(binding, publish({ ...snapshot, machineId: Machine }));
+    assert.equal(f.calls.length, 2);
 });
 
 test("only CAS conflicts receive the metadata-conflict code and no HTTP failure retries", async t => {

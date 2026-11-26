@@ -32,14 +32,14 @@ function startMain(api, dependencies = {})
     const serviceFactory = dependencies.serviceFactory || require('./service.cjs').createService;
     const claudeHome = dependencies.claudeHome
         || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-    const service = serviceFactory({ claudeHome, dataDir: api.fs.dataDir });
+    const claudeData = dependencies.claudeData ?? electron?.app.getPath('userData');
+    const service = serviceFactory({ claudeHome, claudeData, dataDir: api.fs.dataDir });
     let remote = dependencies.remoteAdapter;
     if (remote === undefined && electron)
     {
         const transport = require('./remote-transport.cjs').createTransport({
             fetch: (...args) => electron.net.fetch(...args) });
-        remote = require('./remote-adapter.cjs').createRemoteAdapter({ service, claudeHome,
-            claudeData: electron.app.getPath('userData'), transport,
+        remote = require('./remote-adapter.cjs').createRemoteAdapter({ service, claudeHome, claudeData, transport,
             nameCache: { get: () => api.storage.get('hostNames', []),
                 set: entries => api.storage.set('hostNames', entries) } });
         Promise.resolve(remote.ready).catch(() => api.log.warn('Daily Usage remote listener unavailable'));

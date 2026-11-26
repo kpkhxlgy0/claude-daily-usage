@@ -41,7 +41,7 @@ function fixture(t, remoteAdapter)
     const api = { manifest: { id: 'com.kpk.daily-usage' }, fs: { dataDir: '/owned/data' },
         log: { info() {} }, ipc: { handle() { throw new Error('SDK query timeout must be bypassed'); } } };
     const main = startMain(api, { ipcMain, serviceFactory: options => { serviceOptions = options; return service; },
-        BrowserWindow: { fromWebContents: sender => sender.window }, remoteAdapter });
+        BrowserWindow: { fromWebContents: sender => sender.window }, remoteAdapter, claudeData: '/desktop/user-data' });
     t.after(() => main.stop());
     const send = (name, event, payload) => ipcMain.emit(Prefix + name, event, payload);
     const invoke = (name, event, payload) => handlers.get(Prefix + name)(event, payload);
@@ -59,6 +59,7 @@ test('startup registers event queries but does no scan or remote work', async t 
     assert.equal(f.handlers.has(Prefix + 'query'), false);
     assert.equal(f.ipcMain.listenerCount(Prefix + 'query'), 1);
     assert.equal(f.serviceOptions.claudeHome, process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
+    assert.equal(f.serviceOptions.claudeData, '/desktop/user-data');
     assert.equal(f.serviceOptions.dataDir, '/owned/data');
     const hosts = await f.invoke('hosts', frame());
     assert.equal(hosts.length, 1);

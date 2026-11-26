@@ -152,6 +152,16 @@ test("results round-trip only validated aggregates with exact machine and publis
     assert.throws(() => result("error", { error: "private exception text\n" }));
 });
 
+test("version 2 is an exact, optional marker field that survives cancellation", () => {
+    const marker = protocol.makeMarker({ ...options, snapshotVersion: 2 });
+    assert.equal(marker.snapshotVersion, 2);
+    assert.equal(protocol.validateMarker(marker, { binding, now: Now }).ok, true);
+    assert.deepEqual(protocol.makeMarker(options, "cancel", marker), { ...marker, action: "cancel", sequence: 2 });
+    for (const value of [undefined, null, 1, 3, "2"]) {
+        assert.equal(protocol.validateMarker({ ...marker, snapshotVersion: value }, { binding, now: Now }).ok, false);
+    }
+});
+
 test("five-second machine clock skew keeps the original deadline while rejecting larger future skew", () => {
     const marker = protocol.makeMarker(options);
     for (const offset of [-5000, 5000]) {
