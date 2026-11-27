@@ -108,8 +108,8 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
 
     async function removeAdvertisement(runner, signal)
     {
-        for (const key of runner.snapshotCapabilityKeys || [])
-            await removeValue(runner.binding, key, runner.capabilities, signal).catch(() => {});
+        if (runner.capabilities)
+            await removeValue(runner.binding, protocol.CapabilitiesV4Key, runner.capabilities, signal).catch(() => {});
         if (runner.capabilities) await removeValue(runner.binding, protocol.CapsKey,
             runner.capabilities, signal).catch(() => {});
         if (runner.machine) await removeValue(runner.binding, protocol.MachineKey,
@@ -194,31 +194,46 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             check(controller.signal);
             timer = setTimeout(close, Math.max(1, Math.min(protocol.MaxDemandMs, marker.expiresAt - now())));
             timer.unref?.();
-            let value;
-            try
+            const capKey = protocol.CapabilitiesV4Key;
+            const version = protocol.FullCycleSnapshotVersion;
+            const compatible = marker.snapshotVersion === version
+                && protocol.supportsFullCycleSnapshots(detail.metadata[capKey], caps);
+            const key = protocol.resultKey(requestId);
+            if (detail.metadata[key] !== null) return;
+            let value = { status: 'error', error: 'snapshot-update-required' };
+            if (compatible)
             {
-                value = await step(service.query({ signal: controller.signal,
-                    organizationId: runner.binding.organizationId }), controller.signal);
-            }
-            catch (error)
-            {
-                if (controller.signal.aborted || error?.name === 'AbortError') return;
-                value = { status: 'error' };
+                try
+                {
+                    value = await step(service.query({ signal: controller.signal,
+                        organizationId: runner.binding.organizationId }), controller.signal);
+                }
+                catch (error)
+                {
+                    if (controller.signal.aborted || error?.name === 'AbortError') return;
+                    value = { status: 'error' };
+                }
             }
             check(controller.signal);
             if (runners.get(runner.key) !== runner || now() >= marker.expiresAt) return;
-            const capKey = protocol.snapshotCapabilityKey(marker.snapshotVersion);
-            const extended = capKey && protocol.supportsWeeklySnapshots(detail.metadata[capKey], caps);
-            const result = protocol.makeResult({ requestId, publisherId: identity.publisherId,
-                expiresAt: marker.expiresAt, now: now(), status: value?.status === 'ok' ? 'ok' : 'error',
-                ...(extended ? { snapshotVersion: marker.snapshotVersion } : {}),
-                ...(value?.status === 'ok' ? { snapshot: value.snapshot } : { error: 'source-unavailable' }) });
-            const key = protocol.resultKey(requestId);
-            if (detail.metadata[key] !== null) return;
+            const response = { requestId, publisherId: identity.publisherId, expiresAt: marker.expiresAt, now: now() };
+            let result;
+            try
+            {
+                result = value?.status === 'ok'
+                    ? protocol.makeResult({ ...response, status: 'ok', snapshotVersion: version, snapshot: value.snapshot })
+                    : protocol.makeResult({ ...response, status: 'error',
+                        error: ['snapshot-too-large', 'snapshot-update-required'].includes(value?.error)
+                            ? value.error : 'source-unavailable' });
+            }
+            catch
+            {
+                result = protocol.makeResult({ ...response, status: 'error', error: 'source-unavailable' });
+            }
             await step(transport.patch(runner.binding, [
                 { op: 'test', path: ownedPath(protocol.requestKey(requestId)), value: marker },
                 { op: 'test', path: ownedPath(protocol.CapsKey), value: runner.capabilities },
-                ...(extended ? [{ op: 'test', path: ownedPath(capKey), value: detail.metadata[capKey] }] : []),
+                ...(compatible ? [{ op: 'test', path: ownedPath(capKey), value: detail.metadata[capKey] }] : []),
                 { op: 'test', path: ownedPath(key), value: null },
                 { op: 'replace', path: ownedPath(key), value: result }
             ], { signal: controller.signal }), controller.signal);
@@ -284,14 +299,9 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             {
                 const operations = [{ op: 'test', path: '', value: detail.metadata },
                     { op: 'add', path: ownedPath(protocol.CapsKey), value }];
-                runner.snapshotCapabilityKeys = [];
-                for (const key of [protocol.CapabilitiesV2Key, protocol.CapabilitiesV3Key])
-                {
-                    if (Object.hasOwn(detail.metadata, key) && !protocol.validateCapabilities(detail.metadata[key]).ok)
-                        continue;
-                    runner.snapshotCapabilityKeys.push(key);
+                const key = protocol.CapabilitiesV4Key;
+                if (!Object.hasOwn(detail.metadata, key) || protocol.validateCapabilities(detail.metadata[key]).ok)
                     operations.push({ op: 'add', path: ownedPath(key), value });
-                }
                 let machine;
                 try
                 {
@@ -484,7 +494,9 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             await step(refresh(true), controller.signal);
             let detail = await step(transport.get(binding, { signal: controller.signal }), controller.signal);
             const caps = detail.metadata[protocol.CapsKey];
-            if (!protocol.validateCapabilities(caps).ok) throw failure('snapshot-update-required');
+            const capKey = protocol.CapabilitiesV4Key;
+            if (!protocol.supportsFullCycleSnapshots(detail.metadata[capKey], caps))
+                throw failure('snapshot-update-required');
             watch = await step(transport.watch(binding, { signal: controller.signal }), controller.signal);
             const requestId = protocol.createRequestId();
             const key = protocol.requestKey(requestId);
@@ -493,10 +505,8 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             {
                 if (Object.hasOwn(detail.metadata, key) || Object.hasOwn(detail.metadata, resultKey))
                     throw failure('request-conflict');
-                const snapshotVersion = [protocol.HistorySnapshotVersion, protocol.WeeklySnapshotVersion].find(version =>
-                    protocol.supportsWeeklySnapshots(detail.metadata[protocol.snapshotCapabilityKey(version)], caps));
                 marker = protocol.makeMarker({ requestId, publisherId: caps.publisherId,
-                    viewerId, binding, now: now(), snapshotVersion });
+                    viewerId, binding, now: now(), snapshotVersion: protocol.FullCycleSnapshotVersion });
                 write = transport.patch(binding, [{ op: 'test', path: '', value: detail.metadata },
                     { op: 'add', path: ownedPath(key), value: marker },
                     { op: 'add', path: ownedPath(resultKey), value: null }], { signal: controller.signal });
@@ -505,7 +515,9 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
                 {
                     if (attempt || error?.code !== 'metadata-conflict') throw error;
                     detail = await step(transport.get(binding, { signal: controller.signal }), controller.signal);
-                    if (!equal(detail.metadata[protocol.CapsKey], caps)) throw failure('snapshot-identity');
+                    if (!equal(detail.metadata[protocol.CapsKey], caps)
+                        || !protocol.supportsFullCycleSnapshots(detail.metadata[capKey], caps))
+                        throw failure('snapshot-identity');
                 }
             }
             advertised = true;
@@ -520,16 +532,18 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
                 break;
             }
             const response = await step(transport.get(binding, { signal: controller.signal }), controller.signal);
-            if (!equal(response.metadata[protocol.CapsKey], caps)) throw failure('snapshot-identity');
+            if (!equal(response.metadata[protocol.CapsKey], caps)
+                || !protocol.supportsFullCycleSnapshots(response.metadata[capKey], caps)) throw failure('snapshot-identity');
             received = response.metadata[protocol.resultKey(marker.requestId)];
             const parsed = protocol.validateResult(received, { requestId: marker.requestId,
-                publisherId: caps.publisherId, machineId: caps.machineId, snapshotVersion: marker.snapshotVersion,
+                publisherId: caps.publisherId, machineId: caps.machineId,
                 now: now() });
             if (!parsed.ok) throw failure(parsed.reason === 'update-required'
                 ? 'snapshot-update-required' : 'snapshot-invalid');
             if (received.status === 'cancelled') throw failure('cancelled');
             if (received.status === 'error')
-                throw failure(received.error === 'snapshot-too-large' ? 'snapshot-too-large' : 'source-unavailable');
+                throw failure(['snapshot-too-large', 'snapshot-update-required'].includes(received.error)
+                    ? received.error : 'source-unavailable');
             check(controller.signal);
             const history = accepted.get(hostId);
             const previous = history?.snapshot;

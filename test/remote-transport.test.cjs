@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createTransport } = require("../src/remote-transport.cjs");
-const { makeMarker, makeCapabilities, makeResult, requestKey, resultKey, CapsKey, CapabilitiesV2Key } =
+const { makeMarker, makeCapabilities, makeResult, requestKey, resultKey, CapsKey, CapabilitiesV4Key } =
     require("../src/remote-protocol.cjs");
 
 const Now = 1794873600000;
@@ -13,7 +13,7 @@ const Machine = "33333333-3333-4333-8333-333333333333";
 const Organization = "55555555-5555-4555-8555-555555555555";
 const binding = { bridgeSessionId: "session_test", organizationId: Organization, accountId: Publisher };
 const base = "https://claude.ai/v1/code/sessions/session_test";
-const marker = () => makeMarker({ requestId: Request, publisherId: Publisher, viewerId: Machine, binding, now: Now });
+const marker = () => makeMarker({ requestId: Request, publisherId: Publisher, viewerId: Machine, binding, now: Now, snapshotVersion: 4 });
 const caps = () => makeCapabilities({ machineId: Machine, publisherId: Publisher });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -114,8 +114,9 @@ test("detail bodies are bounded while native identity wrapper variations are acc
 test("metadata writes require CAS ownership and cannot mutate root or foreign keys", async t => {
     const f = fixture(); t.after(() => f.transport.dispose());
     const key = requestKey(Request), value = marker();
-    const operations = [{ op: "test", path: "", value: { sibling: { untouched: true } } },
-        { op: "add", path: "/" + key, value }];
+    const operations = [{ op: "test", path: "", value: { sibling: { untouched: true },
+        [CapsKey]: caps(), [CapabilitiesV4Key]: caps() } },
+        { op: "add", path: "/" + key, value }, { op: "add", path: "/" + resultKey(Request), value: null }];
     await f.transport.patch(binding, operations);
     assert.equal(f.calls[0].url, base);
     assert.equal(f.calls[0].init.method, "PUT");
@@ -141,7 +142,7 @@ test("metadata writes require CAS ownership and cannot mutate root or foreign ke
 test("result reservation is atomic with its absent query marker and result writes compare all ownership", async t => {
     const f = fixture(); t.after(() => f.transport.dispose());
     const key = requestKey(Request), result = "claudepp_daily_usage_result_" + Request;
-    await f.transport.patch(binding, [{ op: "test", path: "", value: { sibling: "preserved" } },
+    await f.transport.patch(binding, [{ op: "test", path: "", value: { sibling: "preserved", [CapsKey]: caps(), [CapabilitiesV4Key]: caps() } },
         { op: "add", path: "/" + key, value: marker() }, { op: "add", path: "/" + result, value: null }]);
     const before = f.calls.length;
     for (const operations of [
@@ -156,34 +157,37 @@ test("result reservation is atomic with its absent query marker and result write
         { op: "test", path: "/" + result, value: null }, { op: "remove", path: "/" + result }]);
 });
 
-test("weekly negotiation rejects unbound capabilities and weekly results for another machine", async t => {
+test("v4 negotiation rejects unbound capabilities and results for another machine", async t => {
     const f = fixture(); t.after(() => f.transport.dispose());
     const own = caps();
     const foreign = makeCapabilities({ machineId: Organization, publisherId: Publisher });
-    const weeklyMarker = makeMarker({ ...marker(), binding, now: Now, snapshotVersion: 2 });
+    const weeklyMarker = makeMarker({ ...marker(), binding, now: Now, snapshotVersion: 4 });
     const request = "/" + requestKey(Request), result = "/" + resultKey(Request);
     const root = value => ({ op: "test", path: "", value });
-    const version2 = "/" + CapabilitiesV2Key;
+    const version4 = "/" + CapabilitiesV4Key;
     const reserve = value => [root(value), { op: "add", path: request, value: weeklyMarker },
         { op: "add", path: result, value: null }];
-    const snapshot = { source: "com.kpk.daily-usage", schemaVersion: 2, machineId: Organization,
+    const snapshot = { source: "com.kpk.daily-usage", schemaVersion: 4, machineId: Organization,
         publisherId: Publisher, revision: 1, generatedAt: Now, timezone: "Asia/Shanghai",
-        from: "2026-11-17", to: "2026-11-17", rows: [], weekly: null,
+        from: "2026-11-17", to: "2026-11-17", rows: [], weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 },
+            unassigned: { requests: 0, usd: 0 } },
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
         pricing: { basis: "claude-client-estimate", asOf: "2026-11-17", source: "fixture" } };
     const publish = resultSnapshot => [{ op: "test", path: request, value: weeklyMarker },
-        { op: "test", path: "/" + CapsKey, value: own }, { op: "test", path: version2, value: own },
+        { op: "test", path: "/" + CapsKey, value: own }, { op: "test", path: version4, value: own },
         { op: "test", path: result, value: null }, { op: "replace", path: result, value: makeResult({
             requestId: Request, publisherId: Publisher, expiresAt: Now + 300000, status: "ok",
-            now: Now, snapshotVersion: 2, snapshot: resultSnapshot }) }];
+            now: Now, snapshotVersion: 4, snapshot: resultSnapshot }) }];
     for (const operations of [
-        [root({ [CapsKey]: own }), { op: "add", path: version2, value: foreign }],
-        reserve({ [CapsKey]: own }), reserve({ [CapsKey]: own, [CapabilitiesV2Key]: foreign }),
-        reserve({ [CapsKey]: own, [CapabilitiesV2Key]: own }).slice(0, 2),
+        [root({ [CapsKey]: own }), { op: "add", path: version4, value: foreign }],
+        reserve({ [CapsKey]: own }), reserve({ [CapsKey]: own, [CapabilitiesV4Key]: foreign }),
+        reserve({ [CapsKey]: own, [CapabilitiesV4Key]: own }).slice(0, 2),
+        reserve({ [CapsKey]: own, [CapabilitiesV4Key]: own }).map(operation => operation.path === request
+            ? { ...operation, value: { ...weeklyMarker, snapshotVersion: 3 } } : operation),
         publish(snapshot),
     ]) await assert.rejects(f.transport.patch(binding, operations), { code: "invalid" });
     assert.equal(f.calls.length, 0);
-    await f.transport.patch(binding, reserve({ [CapsKey]: own, [CapabilitiesV2Key]: own }));
+    await f.transport.patch(binding, reserve({ [CapsKey]: own, [CapabilitiesV4Key]: own }));
     await f.transport.patch(binding, publish({ ...snapshot, machineId: Machine }));
     assert.equal(f.calls.length, 2);
 });

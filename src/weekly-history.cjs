@@ -3,20 +3,24 @@
 const fs = require('node:fs/promises');
 const { constants } = require('node:fs');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { normalizeThreadId } = require('./protocol.cjs');
 
 const WeekMs = 7 * 24 * 60 * 60 * 1000;
 const MaxHistoryBytes = 4 * 1024 * 1024;
 const MaxHistorySamples = 20000;
+const MaxResetAnchors = 8;
 const MaxPreviousWeeks = 3;
 const FullPercent = 100;
 const ResetLowFraction = 0.5;
+const MaxResetSampleGapMs = 48 * 60 * 60 * 1000;
+const ResetToleranceMs = 1000;
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-async function readHistory(claudeData)
+async function readBoundedJson(filename, maxBytes)
 {
-    const filename = path.join(claudeData, 'plan-usage-history.json');
     const file = await fs.lstat(filename);
-    if (!file.isFile() || !file.size || file.size > MaxHistoryBytes) return null;
+    if (!file.isFile() || !file.size || file.size > maxBytes) return null;
     const handle = await fs.open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
     try
     {
@@ -37,153 +41,156 @@ async function readHistory(claudeData)
     finally { await handle.close(); }
 }
 
-function selectSamples(data, generatedAt)
-{
-    if (data?.version !== 2 || !Array.isArray(data.samples) || data.samples.length > MaxHistorySamples) return null;
-    const samples = [];
-    for (const sample of data.samples)
-    {
-        if (!record(sample) || !Number.isSafeInteger(sample.t) || sample.t <= 0) return null;
-        const at = sample.t;
-        const previous = samples.at(-1);
-        // Desktop 按观察顺序追加。回拨的时间戳不能改变已观察到的周期。
-        if (at > generatedAt || at < previous?.at) continue;
-        const { org, u } = sample;
-        if (!(org === null || typeof org === 'string' && org.length > 0 && org.length <= 256)
-            || !record(u)) return null;
-        const percent = u.sd;
-        if (percent !== undefined && (!Number.isFinite(percent) || percent < 0 || percent > FullPercent)) return null;
-        if (at === previous?.at)
-        {
-            if (org !== previous.org || percent !== previous.percent) return null;
-            continue;
-        }
-        samples.push({ at, org, percent });
-    }
-    const last = samples.at(-1);
-    if (!last?.org) return null;
-    const boundary = samples.findLastIndex(sample => sample.org !== last.org);
-    return { organizationId: last.org, samples: samples.slice(boundary + 1).filter(sample => sample.percent !== undefined),
-        currentEligible: last.percent !== undefined && generatedAt - last.at < WeekMs
-            && (boundary < 0 || generatedAt - samples[boundary].at >= WeekMs) };
-}
-
-function prependHistory(history, latest, minMissing, maxMissing)
-{
-    const missing = Array(Math.min(MaxPreviousWeeks, minMissing)).fill(null);
-    return (minMissing === maxMissing ? [...missing, latest, ...history] : [...missing, null])
-        .slice(0, MaxPreviousWeeks);
-}
-
-function observedWindows(samples, generatedAt)
-{
-    let startAt;
-    let earliestStartAt;
-    let sampleAt;
-    let fullAt;
-    let usedPercent;
-    let previousAt;
-    let possibleReset;
-    let resetLowCeiling;
-    let historical;
-    let history = [];
-    for (const { at, percent } of samples)
-    {
-        if (previousAt === undefined || at - previousAt >= WeekMs)
-        {
-            // 长缺口无法确认上一段观测对应第几个历史周期。
-            if (previousAt !== undefined) history = [null];
-            startAt = earliestStartAt = at;
-            fullAt = null;
-            usedPercent = percent;
-            possibleReset = undefined;
-            resetLowCeiling = undefined;
-        }
-        previousAt = at;
-        if (percent < usedPercent)
-        {
-            // 最晚到期前只采用有归零或明显下降证据的样本。
-            const latestExpiry = startAt + WeekMs;
-            const earlyEvidence = percent === 0 || percent <= usedPercent * ResetLowFraction
-                && (possibleReset?.percent === 0 || earliestStartAt === startAt || at - earliestStartAt >= WeekMs);
-            if (!earlyEvidence && at < latestExpiry)
-            {
-                possibleReset = undefined;
-                continue;
-            }
-            if (!possibleReset || percent < possibleReset.percent
-                || (!earlyEvidence && possibleReset.at < latestExpiry))
-            {
-                possibleReset = { at, percent };
-                continue;
-            }
-            // 同一低值区间内的再次下降只修正本轮的观测起点。
-            const refinesReset = resetLowCeiling !== undefined && usedPercent <= resetLowCeiling
-                && possibleReset.at - earliestStartAt < WeekMs;
-            if (!refinesReset)
-            {
-                // 确认前的最后一个高值可能已经落在没有观察到重置的周期中。
-                const minMissed = Math.floor((sampleAt - startAt) / WeekMs);
-                const maxMissed = Math.floor((sampleAt - earliestStartAt) / WeekMs);
-                history = prependHistory(history, historical, minMissed, maxMissed);
-                earliestStartAt = possibleReset.at >= latestExpiry
-                    ? Math.max(sampleAt, earliestStartAt + WeekMs) : sampleAt;
-                resetLowCeiling = Math.max(possibleReset.percent, usedPercent * ResetLowFraction);
-            }
-            startAt = possibleReset.at;
-            fullAt = null;
-            historical = { startAt, startKind: 'observed', fullAt, usedPercent: possibleReset.percent,
-                sampleAt: startAt, endAt: startAt, partial: true };
-        }
-        possibleReset = undefined;
-        usedPercent = percent;
-        sampleAt = at;
-        if (percent === FullPercent && fullAt === null) fullAt = at;
-        // 历史金额只累计到最早可能重置前的最后一个可信样本。
-        if (at - earliestStartAt < WeekMs)
-        {
-            historical = fullAt === startAt ? null : { startAt, startKind: 'observed', fullAt, usedPercent,
-                sampleAt, endAt: sampleAt, partial: true };
-        }
-    }
-    // 重置可能发生在最后一个可信旧样本之后。原周期在最早可能的下次重置之后不再有效。
-    if (generatedAt - earliestStartAt >= WeekMs)
-    {
-        // 只有确认过重置的周期具有可用于定位历史的起点上下界。
-        if (resetLowCeiling === undefined || generatedAt - startAt < WeekMs) return { window: null, history: [] };
-        const minElapsed = Math.floor((generatedAt - startAt) / WeekMs);
-        const maxElapsed = Math.floor((generatedAt - earliestStartAt) / WeekMs);
-        if (possibleReset)
-        {
-            // 已到期区间内未确认的低值不改变已知的历史位置。
-            const expiryOffset = Math.floor((possibleReset.at - earliestStartAt) / WeekMs) * WeekMs;
-            if (minElapsed !== maxElapsed || expiryOffset < WeekMs || possibleReset.at > startAt + expiryOffset)
-            {
-                return { window: null, history: [] };
-            }
-        }
-        return { window: null, history: prependHistory(history, historical, minElapsed - 1, maxElapsed - 1) };
-    }
-    if (possibleReset) return { window: null, history: [] };
-    const window = sampleAt !== previousAt || fullAt === startAt ? null
-        : { startAt, startKind: 'observed', fullAt, usedPercent, sampleAt };
-    return { window, history };
-}
-
-async function readWeeklyWindows(claudeData, generatedAt)
+async function readWeeklySamples(claudeData, generatedAt)
 {
     if (typeof claudeData !== 'string' || !path.isAbsolute(claudeData)) return null;
     try
     {
-        const selected = selectSamples(await readHistory(claudeData), generatedAt);
-        if (!selected?.samples.length) return null;
-        const { organizationId, samples, currentEligible } = selected;
-        const { window, history } = observedWindows(samples, generatedAt);
-        const current = currentEligible ? window : null;
-        return { organizationId: current || history.some(Boolean) ? organizationId : undefined,
-            window: current, history };
+        const data = await readBoundedJson(path.join(claudeData, 'plan-usage-history.json'), MaxHistoryBytes);
+        if (data?.version !== 2 || !Array.isArray(data.samples) || data.samples.length > MaxHistorySamples) return null;
+        const samples = [];
+        for (const sample of data.samples)
+        {
+            if (!record(sample) || !Number.isSafeInteger(sample.t) || sample.t <= 0) return null;
+            const at = sample.t;
+            const previous = samples.at(-1);
+            if (at > generatedAt || at < previous?.at) continue;
+            const { org, u } = sample;
+            if (!(org === null || typeof org === 'string' && org.length > 0 && org.length <= 256)
+                || !record(u)) return null;
+            const organizationId = normalizeThreadId(org);
+            const percent = u.sd;
+            if (percent !== undefined && (!Number.isFinite(percent) || percent < 0 || percent > FullPercent))
+                return null;
+            if (at === previous?.at)
+            {
+                if (organizationId !== previous.organizationId || percent !== previous.percent) return null;
+                continue;
+            }
+            samples.push({ at, organizationId, percent });
+        }
+        const organizationId = samples.at(-1)?.organizationId;
+        if (!organizationId) return null;
+        const lastSwitch = samples.findLastIndex(sample => sample.organizationId !== organizationId);
+        const selected = samples.slice(lastSwitch + 1);
+        return { organizationId, since: lastSwitch < 0 ? 0 : selected[0].at,
+            samples: selected.filter(sample => sample.percent !== undefined) };
     }
     catch { return null; }
 }
 
-module.exports = { readWeeklyWindows };
+function validResetAnchor(anchor, generatedAt)
+{
+    return record(anchor) && Number.isSafeInteger(anchor.resetAt) && Number.isSafeInteger(anchor.observedAt)
+        && anchor.observedAt > 0 && anchor.observedAt <= generatedAt
+        && anchor.resetAt > anchor.observedAt && anchor.resetAt - anchor.observedAt <= WeekMs + ResetToleranceMs
+        && (anchor.usedPercent === null
+            || Number.isFinite(anchor.usedPercent) && anchor.usedPercent >= 0 && anchor.usedPercent <= FullPercent)
+        && (anchor.firstFullAt == null || Number.isSafeInteger(anchor.firstFullAt)
+            && anchor.firstFullAt >= anchor.resetAt - WeekMs && anchor.firstFullAt <= anchor.observedAt);
+}
+
+function scopedPath(filepath)
+{
+    const resolved = path.resolve(filepath);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function loadWeeklyContext({ claudeHome, claudeData, dataDir, generatedAt, allowOrganization = () => true })
+{
+    if (!dataDir || !path.isAbsolute(dataDir)) return null;
+    const selected = await readWeeklySamples(claudeData, generatedAt);
+    if (!selected) return null;
+    const { organizationId, since } = selected;
+    if (!allowOrganization(organizationId)) return null;
+    const scope = [organizationId, scopedPath(claudeData), scopedPath(claudeHome)];
+    const identity = createHash('sha256').update(JSON.stringify(scope)).digest('hex');
+    const anchorFile = path.join(dataDir, 'weekly-reset-' + identity + '.json');
+    let anchors = [];
+    try
+    {
+        const directory = await fs.lstat(dataDir);
+        if (!directory.isDirectory() || directory.isSymbolicLink()) return null;
+        const saved = await readBoundedJson(anchorFile, 8192);
+        if (saved?.version === 1 && saved.organizationId === organizationId && Array.isArray(saved.anchors)
+            && saved.anchors.length <= MaxResetAnchors)
+            anchors = saved.anchors.filter(anchor => validResetAnchor(anchor, generatedAt) && anchor.observedAt >= since);
+    }
+    catch { /* 没有已验证的磁盘锚点。 */ }
+    return { organizationId, anchorFile, anchors };
+}
+
+function resetDrops(samples)
+{
+    const drops = [];
+    for (let index = 1; index < samples.length; index++)
+    {
+        const before = samples[index - 1];
+        const after = samples[index];
+        if (before.percent > 0 && after.percent <= before.percent * ResetLowFraction
+            && after.at - before.at <= MaxResetSampleGapMs) drops.push({ after: before.at, by: after.at });
+    }
+    return drops;
+}
+
+async function readWeeklyWindows(claudeData, generatedAt, context)
+{
+    if (!context?.organizationId || !Array.isArray(context.anchors) || !context.anchors.length) return null;
+    const selected = await readWeeklySamples(claudeData, generatedAt);
+    if (!selected || selected.organizationId !== context.organizationId) return null;
+    const anchors = context.anchors.filter(anchor => validResetAnchor(anchor, generatedAt)
+        && anchor.observedAt >= selected.since).sort((left, right) => left.observedAt - right.observedAt);
+    const latest = anchors.at(-1);
+    if (!latest) return null;
+
+    const phase = latest.resetAt;
+    const closestBoundary = at => phase + Math.round((at - phase) / WeekMs) * WeekMs;
+    const lastDifferentPhase = anchors.findLastIndex(anchor => Math.abs(anchor.resetAt - closestBoundary(anchor.resetAt))
+        > ResetToleranceMs);
+    const samePhase = anchors.slice(lastDifferentPhase + 1);
+    const knownResets = new Set(samePhase.map(anchor => closestBoundary(anchor.resetAt)));
+    const drops = resetDrops(selected.samples);
+    const evidence = [...knownResets].map(at => at - WeekMs);
+    // 采样无法给出精确重置时刻。与官方相位重合的下降区间可佐证前后两端之间的完整周。
+    const phaseChangeCutoff = anchors[lastDifferentPhase]?.resetAt ?? 0;
+    for (const drop of drops)
+    {
+        const boundary = closestBoundary(drop.by);
+        if (drop.after >= phaseChangeCutoff && drop.after < boundary && boundary <= drop.by)
+            evidence.push(boundary);
+    }
+
+    const firstSupportedStart = Math.min(...evidence);
+    const lastSupportedStart = Math.max(...evidence);
+    const currentStart = phase + Math.floor((generatedAt - phase) / WeekMs) * WeekMs;
+    const samples = [...selected.samples];
+    for (const anchor of samePhase)
+    {
+        if (anchor.firstFullAt != null) samples.push({ at: anchor.firstFullAt, percent: FullPercent });
+        if (anchor.usedPercent !== null) samples.push({ at: anchor.observedAt, percent: anchor.usedPercent });
+    }
+    samples.sort((left, right) => left.at - right.at);
+    const periods = Array.from({ length: MaxPreviousWeeks + 1 }, (_, index) =>
+    {
+        const startAt = currentStart - index * WeekMs;
+        if (startAt < Math.max(firstSupportedStart, selected.since, phaseChangeCutoff)
+            || startAt > lastSupportedStart) return null;
+        const resetAt = startAt + WeekMs;
+        const endAt = Math.min(resetAt - 1, generatedAt);
+        const within = samples.filter(sample => sample.at >= startAt && sample.at <= endAt);
+        const last = within.at(-1);
+        const fullAt = within.find(sample => sample.percent === FullPercent)?.at ?? null;
+        const anomaly = drops.some(drop => drop.after >= startAt && drop.by < resetAt);
+        return { startAt, resetAt, endAt,
+            startKind: !anomaly && (knownResets.has(resetAt) || knownResets.has(startAt)) ? 'reset' : 'inferred',
+            sampleAt: last?.at ?? null, usedPercent: last?.percent ?? null, fullAt, partial: anomaly || !last };
+    });
+    const [window, ...history] = periods;
+    const earlierBefore = history[MaxPreviousWeeks - 1]?.startAt;
+    while (history.length && history.at(-1) === null) history.pop();
+    if (!window && !history.some(Boolean)) return null;
+    return { organizationId: selected.organizationId, window, history, earlierBefore,
+        earlierSince: Math.max(selected.since, phaseChangeCutoff) };
+}
+
+module.exports = { loadWeeklyContext, readWeeklyWindows, validResetAnchor, ResetToleranceMs, MaxResetAnchors };

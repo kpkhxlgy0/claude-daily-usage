@@ -130,9 +130,9 @@ function createLogParser({ sourceId, minTimestamp = -Infinity } = {})
                 from = end + 1;
             }
         },
-        finish()
+        finish({ discardTail = false } = {})
         {
-            if (!finished) segment(Buffer.alloc(0), true);
+            if (!finished && !discardTail) segment(Buffer.alloc(0), true);
             finished = true;
             return { sourceId, events, skippedRecords, oversizedRecords };
         },

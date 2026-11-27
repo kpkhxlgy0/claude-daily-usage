@@ -23,7 +23,7 @@ function frame(url = 'app://localhost/settings')
     sender.window = new EventEmitter();
     return { senderFrame, sender, replies };
 }
-function fixture(t, remoteAdapter)
+function fixture(t, remoteAdapter, dependencies = {})
 {
     const ipcMain = new EventEmitter();
     const handlers = new Map();
@@ -32,16 +32,16 @@ function fixture(t, remoteAdapter)
     const queries = [];
     let disposed = 0;
     let serviceOptions;
-    const service = { ready: Promise.resolve(), query({ signal })
+    const service = { ready: Promise.resolve(), query({ signal, organizationId, resetSession })
     {
         const pending = deferred();
-        queries.push({ signal, ...pending });
+        queries.push({ signal, organizationId, resetSession, ...pending });
         return pending.promise;
     }, dispose() { disposed++; } };
     const api = { manifest: { id: 'com.kpk.daily-usage' }, fs: { dataDir: '/owned/data' },
         log: { info() {} }, ipc: { handle() { throw new Error('SDK query timeout must be bypassed'); } } };
     const main = startMain(api, { ipcMain, serviceFactory: options => { serviceOptions = options; return service; },
-        BrowserWindow: { fromWebContents: sender => sender.window }, remoteAdapter, claudeData: '/desktop/user-data' });
+        BrowserWindow: { fromWebContents: sender => sender.window }, remoteAdapter, claudeData: '/desktop/user-data', ...dependencies });
     t.after(() => main.stop());
     const send = (name, event, payload) => ipcMain.emit(Prefix + name, event, payload);
     const invoke = (name, event, payload) => handlers.get(Prefix + name)(event, payload);
@@ -255,4 +255,125 @@ test('host-name requests reject malformed demand and stop on window hide', async
     assert.equal(active.signal.aborted, true);
     active.resolve();
     assert.equal(await pending, null);
+});
+
+test('official reset requests use the trusted Electron session and fixed usage endpoint', async t =>
+{
+    const request = [];
+    const resetAt = '2026-12-02T18:00:00.000Z';
+    const options = {
+        remoteAdapter: {},
+        BrowserWindow: { fromWebContents: sender => sender.window, getAllWindows: () =>
+            [{ webContents: frame('https://untrusted.example/').sender }, { webContents: remoteWindow.sender }] }
+    };
+    const remoteWindow = frame('https://claude.ai/settings/usage');
+    remoteWindow.sender.session = { storagePath: '/desktop/user-data', async fetch(url, init)
+    {
+        request.push([url, init]);
+        return new Response(JSON.stringify({ seven_day: { resets_at: resetAt, utilization: 14 },
+            account: { private: 'ignore' } }), { headers: { 'Content-Type': 'application/json' } });
+    } };
+    const f = fixture(t, options.remoteAdapter, options);
+    assert.equal(request.length, 0);
+    const readResetAt = f.serviceOptions.readResetAt;
+    assert.equal(typeof readResetAt, 'function');
+    const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const signal = new AbortController().signal;
+    const result = await readResetAt(org, { signal });
+    assert.deepEqual(result, { resetAt: Date.parse(resetAt), usedPercent: 14 });
+    assert.deepEqual(request, [[`https://claude.ai/api/organizations/${org}/usage`, {
+        method: 'GET', credentials: 'include', redirect: 'error', cache: 'no-store', signal,
+        headers: { Accept: 'application/json' },
+    }]]);
+    assert.equal(await readResetAt('../usage', { signal }), null);
+    assert.equal(request.length, 1);
+});
+
+test('runner anchor acquisition skips ambiguous profiles and honors an owned matching session', async t =>
+{
+    const calls = [];
+    const one = frame('https://claude.ai/settings/usage');
+    const two = frame('https://claude.ai/code/session_other');
+    for (const owner of [one, two])
+    {
+        owner.sender.session = { storagePath: '/desktop/user-data', async fetch()
+        {
+            calls.push(owner);
+            return new Response(JSON.stringify({ seven_day: { resets_at: '2026-12-02T18:00:00.000Z' } }),
+                { headers: { 'Content-Type': 'application/json' } });
+        } };
+    }
+    const f = fixture(t, {}, { BrowserWindow: { getAllWindows: () =>
+        [one, two].map(owner => ({ webContents: owner.sender })) } });
+    const readResetAt = f.serviceOptions.readResetAt;
+    const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    assert.equal(await readResetAt(org), null);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(await readResetAt(org, { resetSession: two.sender.session }), {
+        resetAt: Date.parse('2026-12-02T18:00:00.000Z'), usedPercent: null,
+    });
+    assert.deepEqual(calls, [two]);
+});
+
+test('a windowless runner reads from its own default persistent Electron profile', async t =>
+{
+    const dataPath = path.resolve(os.tmpdir(), 'daily-usage-test-profile');
+    let profileChecks = 0;
+    let requests = 0;
+    const defaultSession = { storagePath: dataPath, async fetch()
+    {
+        requests++;
+        return new Response(JSON.stringify({ seven_day: { resets_at: '2026-12-02T18:00:00.000Z', utilization: 12 } }),
+            { headers: { 'Content-Type': 'application/json' } });
+    } };
+    const f = fixture(t, {}, { claudeData: dataPath, getDefaultSession()
+    {
+        profileChecks++;
+        return defaultSession;
+    } });
+    assert.equal(profileChecks, 0);
+    const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    assert.equal((await f.serviceOptions.readResetAt(org)).usedPercent, 12);
+    defaultSession.storagePath = path.join(dataPath, 'other-profile');
+    assert.equal(await f.serviceOptions.readResetAt(org), null);
+    assert.equal(requests, 1);
+});
+
+test('local demand retains the verified native organization and refuses an unrelated Electron profile', async t =>
+{
+    const profile = path.resolve(os.tmpdir(), 'daily-usage-local-profile');
+    const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const local = frame('https://claude.ai/epitaxy');
+    local.sender.session = { storagePath: profile };
+    local.senderFrame.executeJavaScript = async () => org;
+    const unrelated = frame();
+    unrelated.sender.session = { storagePath: path.join(profile, 'Partitions', 'other') };
+    unrelated.senderFrame.executeJavaScript = async () => org;
+    const f = fixture(t, {}, { claudeData: profile });
+    f.send('query', local, { hostId: 'local', requestId: RequestId });
+    f.send('query', unrelated, { hostId: 'local', requestId: RequestId });
+    await flush();
+    assert.deepEqual(f.queries.map(query => query.organizationId).sort(), [org, null].sort());
+    assert.equal(f.queries.find(query => query.organizationId === org).resetSession, local.sender.session);
+});
+
+test('a local account change while a scan is pending redacts its weekly result', async t =>
+{
+    const profile = path.resolve(os.tmpdir(), 'daily-usage-switch-profile');
+    const owner = frame('https://claude.ai/epitaxy');
+    owner.sender.session = { storagePath: profile };
+    let currentOrg = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    owner.senderFrame.executeJavaScript = async () => currentOrg;
+    const f = fixture(t, {}, { claudeData: profile });
+    f.send('query', owner, { hostId: 'local', requestId: RequestId });
+    await flush();
+    currentOrg = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    f.queries[0].resolve({ status: 'ok', snapshot: { rows: [{ requests: 1, usd: 0.01 }], weekly: { private: true },
+        weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 }, unassigned: { requests: 0, usd: 0 } } } });
+    await flush();
+    const result = owner.replies[0][1].result;
+    assert.equal(result.status, 'ok');
+    assert.equal(result.weeklyStatus, 'organization-unverified');
+    assert.equal(result.snapshot.weekly, null);
+    assert.deepEqual(result.snapshot.weeklyRemainder.unassigned, { requests: 1, usd: 0.01 });
 });

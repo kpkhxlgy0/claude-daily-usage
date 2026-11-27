@@ -6,9 +6,11 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
 const { setTimeout: delay } = require('node:timers/promises');
-const { validateSnapshot, snapshotWithinLimit, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
+const { validateSnapshot, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
+const { loadWeeklyContext, validResetAnchor, ResetToleranceMs, MaxResetAnchors } = require('./weekly-history.cjs');
 
 const SharingRetryMs = 25;
+const ResetRequestTimeoutMs = 2500;
 
 async function ensureDirectory(directory)
 {
@@ -67,7 +69,53 @@ function abortError()
     return Object.assign(new Error('Daily Usage query cancelled'), { name: 'AbortError', code: 'ABORT_ERR' });
 }
 
+function unassignedRemainder(rows)
+{
+    const unassigned = { requests: 0, usd: 0 };
+    for (const row of Array.isArray(rows) ? rows : [])
+    {
+        unassigned.requests += row?.requests;
+        unassigned.usd += row?.usd;
+    }
+    unassigned.usd = Number(unassigned.usd.toFixed(12));
+    return { earlier: { requests: 0, usd: 0 }, unassigned };
+}
+
+function withUnverifiedWeeklyOrganization(state)
+{
+    if (!state.snapshot) return state;
+    return { ...state, weeklyStatus: 'organization-unverified',
+        snapshot: { ...state.snapshot, weekly: null, weeklyHistory: [],
+            weeklyRemainder: unassignedRemainder(state.snapshot.rows) } };
+}
+
+async function requestReset(readResetAt, organizationId, resetSession, ownerSignal, timeoutMs)
+{
+    const timeout = new AbortController();
+    const signal = AbortSignal.any([ownerSignal, timeout.signal]);
+    if (signal.aborted) return null;
+    const timer = setTimeout(() => timeout.abort(), timeoutMs);
+    let cancelled;
+    try
+    {
+        const abort = new Promise(resolve =>
+        {
+            cancelled = () => resolve(null);
+            signal.addEventListener('abort', cancelled, { once: true });
+        });
+        const response = await Promise.race([readResetAt(organizationId, { signal, resetSession }), abort]);
+        return signal.aborted ? null : response;
+    }
+    catch { return null; }
+    finally
+    {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancelled);
+    }
+}
+
 function createService({ claudeHome, claudeData, dataDir, now = Date.now,
+    readResetAt, resetTimeoutMs = ResetRequestTimeoutMs,
     workerFactory = options => new Worker(path.join(__dirname, 'worker.cjs'), options) })
 {
     const directory = path.join(claudeHome, '.daily-usage');
@@ -76,6 +124,7 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
     const lifetime = new AbortController();
     const pending = new Set();
     const terminations = new Set();
+    const preparations = new Set();
     let machineId;
     let revision = 0;
     let stopped = false;
@@ -96,14 +145,14 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
     }
 
     const active = job => !stopped && current === job && job.subscribers.size > 0;
+    const wantsWeekly = (subscriber, organizationId) => subscriber.organizationId === undefined
+        || subscriber.organizationId === organizationId;
 
     function subscriberState({ organizationId })
     {
         if (organizationId === undefined || !state.snapshot
             || organizationId !== null && organizationId === snapshotOrganizationId) return state;
-        if (state.snapshot.schemaVersion === 3)
-            return { ...state, snapshot: { ...state.snapshot, weekly: null, weeklyHistory: [] } };
-        return state.snapshot.weekly ? { ...state, snapshot: { ...state.snapshot, weekly: null } } : state;
+        return withUnverifiedWeeklyOrganization(state);
     }
 
     function settle(subscriber, error, value)
@@ -125,7 +174,7 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
         terminate(job);
     }
 
-    async function complete(job, error, snapshot, weeklyOrganizationId)
+    async function complete(job, error, snapshot, weeklyOrganizationId, weeklyStatus)
     {
         if (!active(job)) return;
         await terminate(job);
@@ -136,17 +185,75 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
         else
         {
             revision++;
-            state = { status: 'ok', snapshot, progress: null };
+            state = { status: 'ok', snapshot, progress: null, ...(weeklyStatus ? { weeklyStatus } : {}) };
             snapshotOrganizationId = normalizeThreadId(weeklyOrganizationId);
         }
         for (const subscriber of job.subscribers) settle(subscriber, null, subscriberState(subscriber));
         job.subscribers.clear();
     }
 
+    async function prepareWeekly(job)
+    {
+        const saved = await loadWeeklyContext({ claudeHome, claudeData, dataDir, generatedAt: now(),
+            allowOrganization: organizationId => [...job.subscribers].some(subscriber => wantsWeekly(subscriber, organizationId)) });
+        if (!saved || !active(job)) return null;
+        const { organizationId, anchorFile } = saved;
+        let { anchors } = saved;
+        let accessDenied = false;
+        const eligible = [...job.subscribers].filter(subscriber => wantsWeekly(subscriber, organizationId));
+        if (active(job) && eligible.length && typeof readResetAt === 'function')
+        {
+            const sessions = new Set(eligible.map(subscriber => subscriber.resetSession).filter(Boolean));
+            const controller = new AbortController();
+            job.reset = { organizationId, controller };
+            const requested = () => active(job) && !controller.signal.aborted;
+            const response = await requestReset(readResetAt, organizationId,
+                sessions.size === 1 ? [...sessions][0] : undefined, controller.signal, resetTimeoutMs);
+            const observedAt = now();
+            const anchor = response && { resetAt: response.resetAt, observedAt, usedPercent: response.usedPercent ?? null };
+            if (requested() && response?.accessDenied)
+            {
+                accessDenied = true;
+                anchors = [];
+                await atomicWrite(anchorFile, { version: 1, organizationId, anchors }, requested,
+                    controller.signal).catch(() => {});
+            }
+            else if (requested() && validResetAnchor(anchor, observedAt))
+            {
+                const latest = anchors.at(-1);
+                let nextAnchors;
+                if (latest && Math.abs(latest.resetAt - anchor.resetAt) <= ResetToleranceMs
+                    && latest.resetAt > observedAt)
+                {
+                    // 同一轮回复的毫秒差异不重新划分已归属的请求。
+                    anchor.resetAt = latest.resetAt;
+                    anchor.firstFullAt = latest.firstFullAt ?? (latest.usedPercent === 100 ? latest.observedAt : null);
+                    if (!validResetAnchor(anchor, observedAt)) anchor.firstFullAt = null;
+                    nextAnchors = [...anchors.slice(0, -1), anchor];
+                }
+                else nextAnchors = [...anchors, anchor].slice(-MaxResetAnchors);
+                await atomicWrite(anchorFile, { version: 1, organizationId, anchors: nextAnchors }, requested,
+                    controller.signal).catch(() => {});
+                if (requested()) anchors = nextAnchors;
+            }
+            job.reset = null;
+        }
+        return { organizationId, anchors, accessDenied };
+    }
+
     function start(job)
     {
         job.controller = new AbortController();
         state = { ...state, status: 'loading', error: null, progress: null };
+        const prepared = prepareWeekly(job).then(weekly => collect(job, weekly),
+            error => complete(job, error));
+        preparations.add(prepared);
+        prepared.finally(() => preparations.delete(prepared));
+    }
+
+    function collect(job, weekly)
+    {
+        if (!active(job)) return;
         try
         {
             job.worker = workerFactory({ workerData: { claudeHome, cacheDir: path.join(dataDir, 'cache'),
@@ -166,12 +273,15 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
                     publishing = publishing.then(async () =>
                     {
                         if (!active(job)) return;
-                        const snapshot = snapshotWithinLimit({ weekly: null, weeklyHistory: [], ...message.report,
-                            schemaVersion: 3, source: 'com.kpk.daily-usage', machineId, publisherId,
-                            revision: revision + 1 }, { now: now() });
-                        if (!snapshot) throw new Error('invalid-report');
+                        const snapshot = { weekly: null, weeklyHistory: [],
+                            weeklyRemainder: unassignedRemainder(message.report?.rows), ...message.report,
+                            schemaVersion: 4, source: 'com.kpk.daily-usage', machineId, publisherId,
+                            revision: revision + 1 };
+                        const checked = validateSnapshot(snapshot, { now: now(), minVersion: 4 });
+                        if (!checked.ok) throw new Error(checked.reason === 'size' ? 'snapshot-too-large' : 'invalid-report');
                         await atomicWrite(reportFile, snapshot, () => active(job), job.controller.signal);
-                        await complete(job, null, snapshot, message.weeklyOrganizationId);
+                        await complete(job, null, snapshot, message.weeklyOrganizationId ?? weekly?.organizationId,
+                            weekly?.accessDenied ? 'access-denied' : undefined);
                     }).catch(error => complete(job, error));
                 }
             });
@@ -187,7 +297,7 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
                 job.finished = true;
                 void complete(job, `collector-exited-${code}`);
             });
-            job.worker.postMessage({ type: 'scan' });
+            job.worker.postMessage({ type: 'scan', weekly: { ...weekly, generatedAt: now() } });
         }
         catch (error)
         {
@@ -216,7 +326,7 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
         try
         {
             const previous = await readJson(reportFile);
-            const checked = validateSnapshot(previous, { now: now() });
+            const checked = validateSnapshot(previous, { now: now(), minVersion: 4 });
             if (previous.machineId === machineId)
             {
                 if (checked.ok) state = { status: 'stale', snapshot: previous, progress: null };
@@ -235,12 +345,12 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
         ready,
         getIdentity: () => machineId ? { machineId, publisherId } : null,
         getState: () => state,
-        query({ signal, organizationId } = {})
+        query({ signal, organizationId, resetSession } = {})
         {
             if (stopped || signal?.aborted) return Promise.reject(abortError());
             return new Promise((resolve, reject) =>
             {
-                const subscriber = { resolve, reject, signal,
+                const subscriber = { resolve, reject, signal, resetSession,
                     organizationId: organizationId === undefined ? undefined : normalizeThreadId(organizationId) };
                 subscriber.abort = () =>
                 {
@@ -248,6 +358,8 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
                     const job = subscriber.job;
                     if (!job) return;
                     job.subscribers.delete(subscriber);
+                    if (job.reset && ![...job.subscribers].some(next => wantsWeekly(next, job.reset.organizationId)))
+                        job.reset.controller.abort();
                     if (!job.subscribers.size) abandon(job);
                 };
                 pending.add(subscriber);
@@ -277,6 +389,7 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
             disposal = (async () =>
             {
                 await ready;
+                await Promise.all([...preparations]);
                 await publishing;
                 await Promise.all([...terminations]);
             })();
@@ -285,4 +398,4 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
     };
 }
 
-module.exports = { createService };
+module.exports = { createService, withUnverifiedWeeklyOrganization };

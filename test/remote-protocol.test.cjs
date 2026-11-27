@@ -14,19 +14,21 @@ const binding = { bridgeSessionId: "session_test", organizationId: "55555555-555
 const options = { requestId: Request, publisherId: Publisher, viewerId: Viewer, binding, now: Now };
 const expected = { requestId: Request, publisherId: Publisher, machineId: Machine, now: Now };
 function snapshot() {
-    return { schemaVersion: 1, source: "com.kpk.daily-usage", machineId: Machine, publisherId: Publisher,
+    return { schemaVersion: 4, source: "com.kpk.daily-usage", machineId: Machine, publisherId: Publisher,
         revision: 1, generatedAt: Now, timezone: "Asia/Shanghai", from: "2026-10-19", to: "2026-11-17",
         rows: [], coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
+        weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 },
+            unassigned: { requests: 0, usd: 0 } },
         pricing: { basis: "claude-client-estimate", asOf: "2026-11-17", source: "https://platform.claude.com/docs/en/about-claude/pricing" } };
 }
 function result(status = "ok", overrides = {}) {
     return protocol.makeResult({ requestId: Request, publisherId: Publisher, expiresAt: Now + 300000,
-        status, snapshot: snapshot(), error: "unavailable", now: Now, ...overrides });
+        status, snapshot: snapshot(), snapshotVersion: 4, error: "unavailable", now: Now, ...overrides });
 }
 
 test("legacy remote dollars require update only after payload and identity validation", () => {
     const value = result();
-    const legacy = snapshot();
+    const { weekly, weeklyHistory, weeklyRemainder, ...legacy } = { ...snapshot(), schemaVersion: 1 };
     legacy.pricing.basis = "standard";
     const encode = snapshot => {
         const bytes = Buffer.from(JSON.stringify(snapshot));
@@ -46,6 +48,7 @@ test("remote aggregation preserves estimated request counts and partial pricing 
     estimated.rows = [{ date: "2026-11-17", model: "claude-opus-5-5", requests: 2, inputTokens: 4231,
         uncachedInputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 4231, outputTokens: 0,
         usd: 0.021155, unpricedRequests: 1, estimatedRequests: 1 }];
+    estimated.weeklyRemainder.unassigned = { requests: 2, usd: 0.021155 };
     estimated.coverage.warnings = ["1 次请求的缓存写入时长未完整覆盖，未知部分按 5 分钟价格估算。"];
     const checked = protocol.validateResult(result("ok", { snapshot: estimated }), expected);
     assert.equal(checked.ok, true);
@@ -159,7 +162,7 @@ test("version 2 is an exact, optional marker field that survives cancellation", 
     assert.deepEqual(protocol.makeMarker(options, "cancel", marker), { ...marker, action: "cancel", sequence: 2 });
     const history = protocol.makeMarker({ ...options, snapshotVersion: 3 });
     assert.equal(protocol.makeMarker(options, "cancel", history).snapshotVersion, 3);
-    for (const value of [undefined, null, 1, 4, "2"]) {
+    for (const value of [undefined, null, 1, 5, "2"]) {
         assert.equal(protocol.validateMarker({ ...marker, snapshotVersion: value }, { binding, now: Now }).ok, false);
     }
 });
@@ -178,26 +181,26 @@ test("five-second machine clock skew keeps the original deadline while rejecting
     assert.equal(protocol.validateResult(future, expected).ok, false);
 });
 
-test("oversized history projects to the current week and an oversized daily report returns a terminal error", () => {
+test("oversized v4 reports return terminal errors without projecting history or pricing", () => {
     const { createHash } = require("node:crypto");
     const models = Array.from({ length: 2400 }, (_, i) => createHash("sha256").update(String(i)).digest("hex"));
-    const base = snapshot();
-    const period = { startAt: Now - 8000, startKind: "inferred", sampleAt: Now - 5000, fullAt: null,
-        usedPercent: 40, endAt: Now - 3000, partial: false, rows: models.map(model =>
-            ({ model, requests: 1, baseUsd: 4, usd: 4, unpricedRequests: 0, estimatedRequests: 0 })) };
-    const current = { ...base, schemaVersion: 2, weekly: null };
-    const history = { ...current, schemaVersion: 3, weeklyHistory: [period] };
-    const fromRunner = value => result("ok", { snapshot: value, snapshotVersion: 3 });
-    const fits = protocol.validateResult(fromRunner(history), { ...expected, snapshotVersion: 3 });
-    assert.deepEqual(fits, { ok: true, snapshot: current });
-    assert.equal(history.weeklyHistory[0].rows.length, models.length);
-    const rows = models.map(model => ({ date: base.to, model, requests: 1, inputTokens: 1,
+    const large = snapshot();
+    large.rows = models.map(model => ({ date: large.to, model, requests: 1, inputTokens: 1,
         uncachedInputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1,
         usd: 4, unpricedRequests: 0, estimatedRequests: 0 }));
-    const rejected = fromRunner({ ...history, rows });
+    large.weeklyHistory = [{ startAt: Now - 8000, resetAt: Now - 3000, endAt: Now - 3001,
+        startKind: "inferred", sampleAt: Now - 5000, fullAt: null, usedPercent: 40, partial: false,
+        afterFull: { requests: 0, usd: 0 }, rows: models.map(model =>
+            ({ model, requests: 1, usd: 4, unpricedRequests: 0, estimatedRequests: 0 })) }];
+    const rejected = result("ok", { snapshot: large });
     assert.equal(rejected.status, "error");
     assert.equal(rejected.error, "snapshot-too-large");
     assert.equal(protocol.validateResult(rejected, expected).ok, true);
+    assert.equal(Object.hasOwn(rejected, "data"), false);
+    assert.equal(large.weeklyHistory[0].rows.length, models.length);
+    const incompatible = result("ok", { snapshot: snapshot(), snapshotVersion: 3 });
+    assert.equal(incompatible.error, "snapshot-update-required");
+    assert.equal(Object.hasOwn(incompatible, "data"), false);
 });
 
 test("compressed aggregates reject invalid base64, inflated bombs and incorrect byte counts", () => {
@@ -218,4 +221,11 @@ test("compressed aggregates reject invalid base64, inflated bombs and incorrect 
     const bytes = Buffer.from(JSON.stringify({ ...snapshot(), machineId: Viewer }));
     assert.equal(protocol.validateResult({ ...value, data: { encoding: "deflate-base64", bytes: bytes.length,
         dataBase64: deflateSync(bytes).toString("base64") } }, expected).reason, "identity");
+});
+
+test("whole-cycle marker uses the v4 capability and keeps its version on cancellation", () => {
+    assert.equal(protocol.snapshotCapabilityKey(4), "claudepp_daily_usage_capabilities_v4");
+    const latest = protocol.makeMarker({ ...options, snapshotVersion: 4 });
+    assert.equal(protocol.validateMarker(latest, { binding, now: Now }).ok, true);
+    assert.equal(protocol.makeMarker(options, "cancel", latest).snapshotVersion, 4);
 });

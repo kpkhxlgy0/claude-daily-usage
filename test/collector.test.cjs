@@ -134,7 +134,8 @@ test('filters thirty Beijing calendar days after global response deduplication',
     const fixture = await setup(t);
     await fixture.write('dates.jsonl', [response('old', { timestamp: '2026-10-18T15:59:59Z' }),
         response('first', { timestamp: '2026-10-18T16:00:00Z' }),
-        response('last', { timestamp: '2026-11-17T15:59:59Z' }),
+        response('last', { timestamp: '2026-11-17T04:00:00Z' }),
+        response('future-same-day', { timestamp: '2026-11-17T04:00:00.001Z' }),
         response('future', { timestamp: '2026-11-17T16:00:00Z' })]);
     const report = await fixture.collector.scan();
     assert.deepEqual(report.rows.map(row => [row.date, row.requests]), [['2026-11-17', 1], ['2026-10-19', 1]]);
@@ -329,3 +330,122 @@ test('disposing during discovery prevents a source read and leaves no cache dire
     await disposal;
     await assert.rejects(fs.stat(fixture.cacheDir), { code: 'ENOENT' });
 });
+
+test('an append between discovery and open preserves the session and filters the captured prefix by cutoff', async t =>
+{
+    const fixture = await setup(t);
+    const source = await fixture.write('active.jsonl', [response('earlier')]);
+    const open = fs.open;
+    let appended = false;
+    t.mock.method(fs, 'open', async (filename, ...args) =>
+    {
+        if (filename === source && !appended)
+        {
+            appended = true;
+            const updates = [response('before-cutoff'), response('future', { timestamp: '2026-11-17T04:00:00.001Z' })];
+            await fs.appendFile(source, updates.map(JSON.stringify).join('\n') + '\n');
+        }
+        return open(filename, ...args);
+    });
+    const report = await fixture.collector.scan();
+    assert.equal(report.coverage.failedFiles, 0);
+    assert.equal(report.rows[0]?.requests, 2);
+});
+
+test('an append during the bounded read preserves the prefix and prevents caching it as the finished file', async t =>
+{
+    const fixture = await setup(t);
+    const source = await fixture.write('active.jsonl', [response('earlier')]);
+    const later = JSON.stringify(response('later'));
+    await fs.appendFile(source, later.slice(0, 25));
+    const open = fs.open;
+    let appended = false;
+    t.mock.method(fs, 'open', async (filename, ...args) =>
+    {
+        const handle = await open(filename, ...args);
+        if (filename !== source || appended) return handle;
+        const stat = handle.stat.bind(handle);
+        let calls = 0;
+        handle.stat = async () =>
+        {
+            if (++calls === 2)
+            {
+                appended = true;
+                await fs.appendFile(source, later.slice(25) + '\n');
+            }
+            return stat();
+        };
+        return handle;
+    });
+    const report = await fixture.collector.scan();
+    assert.equal(report.coverage.failedFiles, 0);
+    assert.equal(report.coverage.skippedRecords, 0);
+    assert.equal(report.rows[0]?.requests, 1);
+    await assert.rejects(fs.stat(fixture.cacheDir), { code: 'ENOENT' });
+    const next = await fixture.collector.scan();
+    assert.equal(next.coverage.cachedFiles, 0);
+    assert.equal(next.rows[0]?.requests, 2);
+});
+
+test('rewriting and extending a log during a read does not publish mixed requests', async t =>
+{
+    const fixture = await setup(t);
+    const source = await fixture.write('active.jsonl', [response('first')]);
+    const open = fs.open;
+    let rewritten = false;
+    t.mock.method(fs, 'open', async (filename, ...args) =>
+    {
+        const handle = await open(filename, ...args);
+        if (filename !== source || rewritten) return handle;
+        const stat = handle.stat.bind(handle);
+        let calls = 0;
+        handle.stat = async () =>
+        {
+            if (++calls === 2)
+            {
+                rewritten = true;
+                await fs.writeFile(source, [response('other'), response('added')].map(JSON.stringify).join('\n') + '\n');
+            }
+            return stat();
+        };
+        return handle;
+    });
+    const first = await fixture.collector.scan();
+    assert.equal(first.coverage.failedFiles, 1);
+    assert.deepEqual(first.rows, []);
+    const next = await fixture.collector.scan();
+    assert.equal(next.coverage.failedFiles, 0);
+    assert.equal(next.rows[0].requests, 2);
+});
+
+for (const replacement of ['replacement', 'truncation'])
+{
+    test('a source ' + replacement + ' between discovery and open is never read as the previous source', async t =>
+    {
+        const fixture = await setup(t);
+        const source = await fixture.write('active.jsonl', [response('old-first'), response('old-second')]);
+        const open = fs.open;
+        let changed = false;
+        t.mock.method(fs, 'open', async (filename, ...args) =>
+        {
+            if (filename === source && !changed)
+            {
+                changed = true;
+                if (replacement === 'replacement')
+                {
+                    const next = await fixture.write('replacement.tmp', [response('one'), response('two'), response('three')]);
+                    await fs.rename(next, source);
+                }
+                else await fs.writeFile(source, JSON.stringify(response('only')) + '\n');
+            }
+            return open(filename, ...args);
+        });
+        const report = await fixture.collector.scan();
+        assert.equal(report.coverage.failedFiles, 1);
+        assert.deepEqual(report.rows, []);
+        await assert.rejects(fs.stat(fixture.cacheDir), { code: 'ENOENT' });
+        const next = await fixture.collector.scan();
+        assert.equal(next.coverage.failedFiles, 0);
+        assert.equal(next.rows[0]?.requests, replacement === 'replacement' ? 3 : 1);
+    });
+}

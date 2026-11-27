@@ -2,15 +2,13 @@
 
 const { randomUUID } = require("node:crypto");
 const { deflateSync, inflateSync } = require("node:zlib");
-const { normalizeThreadId, snapshotForPeer, validateSnapshot, MaxSnapshotBytes, FutureSkewMs } = require("./protocol.cjs");
+const { normalizeThreadId, validateSnapshot, MaxSnapshotBytes, FutureSkewMs } = require("./protocol.cjs");
 
 const Source = "com.kpk.daily-usage";
 const CapsKey = "claudepp_daily_usage";
-const CapabilitiesV2Key = "claudepp_daily_usage_capabilities_v2";
-const CapabilitiesV3Key = "claudepp_daily_usage_capabilities_v3";
+const CapabilitiesV4Key = "claudepp_daily_usage_capabilities_v4";
 const MachineKey = "claudepp_daily_usage_machine";
-const WeeklySnapshotVersion = 2;
-const HistorySnapshotVersion = 3;
+const FullCycleSnapshotVersion = 4;
 const MaxDemandMs = 300000;
 const MaxCompressedBytes = 64 * 1024;
 const Prefixes = { query: "d411ea01", result: "d411ea02", cancel: "d411ea03" };
@@ -73,11 +71,10 @@ function validateCapabilities(value) {
 }
 
 function snapshotCapabilityKey(version) {
-    if (version === HistorySnapshotVersion) return CapabilitiesV3Key;
-    if (version === WeeklySnapshotVersion) return CapabilitiesV2Key;
+    if (version === FullCycleSnapshotVersion) return CapabilitiesV4Key;
 }
 
-function supportsWeeklySnapshots(advertisement, capabilities) {
+function supportsFullCycleSnapshots(advertisement, capabilities) {
     return validateCapabilities(advertisement).ok && validateCapabilities(capabilities).ok
         && advertisement.machineId === capabilities.machineId && advertisement.publisherId === capabilities.publisherId;
 }
@@ -119,7 +116,7 @@ function makeMarker(options, action = "query", original) {
         return { ...original, action: "cancel", sequence: 2 };
     }
     if (action !== "query" || !Number.isSafeInteger(now + MaxDemandMs)
-        || snapshotVersion !== undefined && !snapshotCapabilityKey(snapshotVersion)) {
+        || snapshotVersion !== undefined && ![2, 3, FullCycleSnapshotVersion].includes(snapshotVersion)) {
         throw new TypeError("Invalid Daily Usage marker");
     }
     return { ...base(), requestId: id, publisherId, viewerId, bridgeSessionId, organizationId,
@@ -132,7 +129,7 @@ function validateMarker(value, options = {}) {
     const { binding, now = Date.now() } = options;
     const keys = ["source", "schemaVersion", "demandVersion", "requestId", "publisherId", "viewerId",
         "bridgeSessionId", "organizationId", "action", "sequence", "requestedAt", "expiresAt"];
-    if (snapshotCapabilityKey(value?.snapshotVersion)) keys.push("snapshotVersion");
+    if ([2, 3, FullCycleSnapshotVersion].includes(value?.snapshotVersion)) keys.push("snapshotVersion");
     if (!validBinding(binding) || !integer(now)
         || !fields(value, keys)
         || !version(value) || !requestId(value.requestId) || !uuid(value.publisherId) || !uuid(value.viewerId)
@@ -151,23 +148,23 @@ function makeResult(options) {
         now = Date.now() } = options;
     const value = { ...base(), requestId: id, publisherId, updatedAt: now, expiresAt, status };
     if (status === "ok") {
-        if (!validateSnapshot(snapshot, { now }).ok || snapshot.publisherId !== publisherId) {
-            throw new TypeError("Invalid Daily Usage snapshot");
-        }
-        let projected = snapshotForPeer(snapshot, snapshotVersion);
-        for (;;) {
-            const bytes = Buffer.from(JSON.stringify(projected), "utf8");
+        const checked = validateSnapshot(snapshot, { now, minVersion: FullCycleSnapshotVersion });
+        if (snapshotVersion !== FullCycleSnapshotVersion || checked.reason === "update-required") {
+            value.status = "error";
+            value.error = "snapshot-update-required";
+        } else if (checked.reason === "size") {
+            value.status = "error";
+            value.error = "snapshot-too-large";
+        } else {
+            if (!checked.ok || snapshot.publisherId !== publisherId) throw new TypeError("Invalid Daily Usage snapshot");
+            const bytes = Buffer.from(JSON.stringify(snapshot), "utf8");
             const compressed = deflateSync(bytes);
-            if (compressed.length <= MaxCompressedBytes) {
-                value.data = { encoding: "deflate-base64", bytes: bytes.length, dataBase64: compressed.toString("base64") };
-                break;
-            }
-            if (projected.schemaVersion === 1) {
+            if (compressed.length > MaxCompressedBytes) {
                 value.status = "error";
                 value.error = "snapshot-too-large";
-                break;
+            } else {
+                value.data = { encoding: "deflate-base64", bytes: bytes.length, dataBase64: compressed.toString("base64") };
             }
-            projected = snapshotForPeer(projected, projected.schemaVersion - 1);
         }
     } else if (status === "error") value.error = error;
     if (!validateResult(value, { requestId: id, publisherId, machineId: snapshot?.machineId, snapshotVersion, now }).ok) {
@@ -178,7 +175,7 @@ function makeResult(options) {
 
 function validateResult(value, options = {}) {
     if (!record(options)) return invalid("invalid");
-    const { requestId: id, publisherId, machineId, snapshotVersion, now = Date.now() } = options;
+    const { requestId: id, publisherId, machineId, now = Date.now() } = options;
     const keys = ["source", "schemaVersion", "demandVersion", "requestId", "publisherId", "updatedAt", "expiresAt", "status"];
     if (value?.status === "ok") keys.push("data");
     if (value?.status === "error") keys.push("error");
@@ -207,18 +204,16 @@ function validateResult(value, options = {}) {
         if (inflated.engine.bytesWritten !== compressed.length || bytes.length !== data.bytes) return invalid("invalid");
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         const snapshot = JSON.parse(text);
-        const checked = validateSnapshot(snapshot, { now });
+        const checked = validateSnapshot(snapshot, { now, minVersion: FullCycleSnapshotVersion });
         if (!checked.ok && checked.reason !== "update-required") return checked;
         if (snapshot.machineId !== machineId || snapshot.publisherId !== publisherId) return invalid("identity");
-        if (snapshot.schemaVersion > (snapshotCapabilityKey(snapshotVersion) ? snapshotVersion : 1))
-            return invalid("invalid");
         if (!checked.ok) return checked;
         return { ok: true, snapshot };
     } catch { return invalid("invalid"); }
 }
 
 module.exports = { createRequestId, signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey, MachineKey,
-    CapabilitiesV2Key, CapabilitiesV3Key, WeeklySnapshotVersion, HistorySnapshotVersion, snapshotCapabilityKey,
-    supportsWeeklySnapshots, normalizeMachineName, makeMachine, validateMachine,
+    CapabilitiesV4Key, FullCycleSnapshotVersion, snapshotCapabilityKey, supportsFullCycleSnapshots,
+    normalizeMachineName, makeMachine, validateMachine,
     requestKey, resultKey, makeCapabilities, makeMarker, validateMarker, validateCapabilities, makeResult,
     validateResult, MaxDemandMs };

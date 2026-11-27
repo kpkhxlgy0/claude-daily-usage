@@ -29,6 +29,13 @@ function fingerprint(stat)
     return ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'birthtimeMs'].map(key => stat[key]).join(':');
 }
 
+function sameFilePrefix(before, after)
+{
+    return after.isFile() && before.dev === after.dev && before.ino === after.ino
+        && before.birthtimeMs === after.birthtimeMs
+        && (after.size > before.size || fingerprint(before) === fingerprint(after));
+}
+
 function validCachedData(data, sourceId)
 {
     const identity = value => value === null || typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -177,53 +184,75 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
         return sources;
     }
 
+    async function readPrefix(handle, size, onChunk)
+    {
+        const hash = createHash('sha256');
+        if (size)
+        {
+            const stream = handle.createReadStream({ start: 0, end: size - 1, autoClose: false,
+                highWaterMark: 64 * 1024 });
+            let bytesRead = 0;
+            activeStreams.add(stream);
+            try
+            {
+                for await (const chunk of stream)
+                {
+                    checkActive();
+                    bytesRead += chunk.length;
+                    hash.update(chunk);
+                    onChunk?.(chunk);
+                }
+            }
+            finally { activeStreams.delete(stream); }
+            if (bytesRead !== size) throw new Error('Usage source was truncated during read');
+        }
+        return hash.digest('hex');
+    }
+
     async function readSource(source, coverage)
     {
         const key = digest(path.relative(claudeHome, source.filename));
         const sourceId = 'file-' + key;
         const cacheFile = path.join(usageCacheDir, key + '.json');
-        const version = fingerprint(source.stat);
         let cached = memory.get(key);
         if (!cached)
         {
             try { cached = JSON.parse(await fs.readFile(cacheFile, 'utf8')); }
             catch { /* 缓存损坏只影响性能，原始日志仍为唯一数据源。 */ }
         }
-        if (cached && cached.schemaVersion === CacheVersion && cached.version === version
-            && validCachedData(cached.data, sourceId))
-        {
-            memory.set(key, cached);
-            coverage.cachedFiles++;
-            return cached.data;
-        }
-        const parser = createLogParser({ sourceId });
         const handle = await fs.open(source.filename, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
-        let stat;
+        let data;
+        let version;
         let after;
         try
         {
             checkActive();
-            stat = await handle.stat();
-            if (!stat.isFile() || fingerprint(stat) !== version)
-                throw new Error('Usage source changed during discovery');
-            if (stat.size)
+            const stat = await handle.stat();
+            if (!sameFilePrefix(source.stat, stat)) throw new Error('Usage source changed during discovery');
+            version = fingerprint(stat);
+            if (cached && cached.schemaVersion === CacheVersion && cached.version === version
+                && validCachedData(cached.data, sourceId))
             {
-                const stream = handle.createReadStream({ start: 0, end: stat.size - 1, autoClose: false,
-                    highWaterMark: 64 * 1024 });
-                activeStreams.add(stream);
-                try
-                {
-                    for await (const chunk of stream) { checkActive(); parser.onChunk(chunk); }
-                }
-                finally { activeStreams.delete(stream); }
+                memory.set(key, cached);
+                coverage.cachedFiles++;
+                return cached.data;
             }
-            after = await handle.stat();
+            const parser = createLogParser({ sourceId });
+            const initialHash = await readPrefix(handle, stat.size, parser.onChunk);
+            const handleAfter = await handle.stat();
+            after = await fs.lstat(source.filename);
+            if (!sameFilePrefix(stat, handleAfter) || !sameFilePrefix(handleAfter, after))
+                throw new Error('Usage source changed during read');
+            const grew = after.size > stat.size;
+            if (grew && (initialHash !== await readPrefix(handle, stat.size)
+                || !sameFilePrefix(after, await fs.lstat(source.filename))))
+                throw new Error('Usage source prefix was rewritten');
+            data = parser.finish({ discardTail: grew });
         }
         finally { await handle.close(); }
         checkActive();
-        const data = parser.finish();
         coverage.parsedFiles++;
-        if (fingerprint(after) !== fingerprint(stat)) return data;
+        if (fingerprint(after) !== version) return data;
         cached = { schemaVersion: CacheVersion, version, data };
         memory.set(key, cached);
         let temporary;
@@ -245,10 +274,10 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
         return data;
     }
 
-    async function scanSources()
+    async function scanSources(weeklyContext)
     {
         checkActive();
-        const generatedAt = now();
+        const generatedAt = weeklyContext?.generatedAt ?? now();
         if (!Number.isFinite(generatedAt) || Math.abs(generatedAt) >= 8.64e15 - DayMs)
             throw new TypeError('Clock returned an invalid timestamp');
         const to = beijingDate(generatedAt);
@@ -260,10 +289,11 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
             overflowRequests: 0, unresolvedInheritedRequests: 0 };
         progress('discovering', coverage);
         const [sources, weeklyWindows] = await Promise.all([
-            discover(coverage), readWeeklyWindows(claudeData, generatedAt),
+            discover(coverage), readWeeklyWindows(claudeData, generatedAt, weeklyContext),
         ]);
         const weeklyPeriods = [weeklyWindows?.window, ...(weeklyWindows?.history || [])].map(window => window
-            ? { window, endAt: window.fullAt ?? window.endAt ?? generatedAt, rows: new Map() } : null);
+            ? { window, rows: new Map(), afterFull: { requests: 0, usd: 0 } } : null);
+        const weeklyRemainder = { earlier: { requests: 0, usd: 0 }, unassigned: { requests: 0, usd: 0 } };
         coverage.files = sources.length;
         const events = [];
         let processedFiles = 0;
@@ -329,10 +359,8 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
                 continue;
             }
             const date = beijingDate(event.timestamp);
-            if (date < from || date > to) continue;
+            if (date < from || date > to || event.timestamp > generatedAt) continue;
             coverage.conflictingRequests += event.conflicts || 0;
-            const weeklyPeriod = weeklyPeriods.find(period => period && event.timestamp >= period.window.startAt
-                && event.timestamp <= period.endAt);
             const usageComplete = UsageFields.slice(0, 4).every(key => event[key] !== null);
             if (!usageComplete) coverage.incompleteRequests++;
             const usage = { ...event, usageComplete: usageComplete && !event.conflicted,
@@ -340,22 +368,6 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
                 cacheWriteTokens: event.cacheWriteTokens ?? 0, outputTokens: event.outputTokens ?? 0 };
             usage.inputTokens = usage.uncachedInputTokens + usage.cachedInputTokens + usage.cacheWriteTokens;
             const price = priceRequest(usage);
-            if (weeklyPeriod)
-            {
-                const weeklyRows = weeklyPeriod.rows;
-                let row = weeklyRows.get(event.model);
-                if (!row)
-                {
-                    row = { model: event.model, requests: 0, baseUsd: 0, usd: 0,
-                        unpricedRequests: 0, estimatedRequests: 0 };
-                    weeklyRows.set(event.model, row);
-                }
-                row.requests++;
-                row.baseUsd += priceRequest(usage, { baseRates: true }).usd;
-                row.usd += price.usd;
-                if (price.unpriced) row.unpricedRequests++;
-                if (price.estimated) row.estimatedRequests++;
-            }
             const key = date + ':' + event.model;
             let row = rows.get(key);
             if (!row)
@@ -378,6 +390,35 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
             row.usd += price.usd;
             if (price.unpriced) { row.unpricedRequests++; unpricedRequests++; }
             if (price.estimated) { row.estimatedRequests++; estimatedRequests++; }
+
+            const weeklyPeriod = weeklyPeriods.find(period => period && event.timestamp >= period.window.startAt
+                && event.timestamp <= period.window.endAt);
+            if (weeklyPeriod)
+            {
+                let weeklyRow = weeklyPeriod.rows.get(event.model);
+                if (!weeklyRow)
+                {
+                    weeklyRow = { model: event.model, requests: 0, usd: 0,
+                        estimatedRequests: 0, unpricedRequests: 0 };
+                    weeklyPeriod.rows.set(event.model, weeklyRow);
+                }
+                weeklyRow.requests++;
+                weeklyRow.usd += price.usd;
+                if (price.unpriced) weeklyRow.unpricedRequests++;
+                if (price.estimated) weeklyRow.estimatedRequests++;
+                if (weeklyPeriod.window.fullAt !== null && event.timestamp > weeklyPeriod.window.fullAt)
+                {
+                    weeklyPeriod.afterFull.requests++;
+                    weeklyPeriod.afterFull.usd += price.usd;
+                }
+            }
+            else
+            {
+                const remainder = event.timestamp < weeklyWindows?.earlierBefore && event.timestamp >= weeklyWindows.earlierSince
+                    ? weeklyRemainder.earlier : weeklyRemainder.unassigned;
+                remainder.requests++;
+                remainder.usd += price.usd;
+            }
         }
         if (coverage.failedFiles) coverage.warnings.push(`有 ${coverage.failedFiles} 个用量文件读取失败。`);
         if (coverage.discoveryErrors) coverage.warnings.push(`有 ${coverage.discoveryErrors} 处历史目录无法读取。`);
@@ -400,22 +441,21 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
         {
             if (!period) return null;
             const rows = [...period.rows.values()].sort((left, right) => left.model.localeCompare(right.model));
-            for (const row of rows)
-            {
-                row.baseUsd = Number(row.baseUsd.toFixed(12));
-                row.usd = Number(row.usd.toFixed(12));
-            }
-            return { ...period.window, rows };
+            for (const row of rows) row.usd = Number(row.usd.toFixed(12));
+            period.afterFull.usd = Number(period.afterFull.usd.toFixed(12));
+            return { ...period.window, partial: period.window.partial || period.window.startAt < cutoff,
+                afterFull: period.afterFull, rows };
         });
+        for (const remainder of Object.values(weeklyRemainder)) remainder.usd = Number(remainder.usd.toFixed(12));
         progress('complete', coverage, processedFiles);
         const report = { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, coverage,
-            pricing: { ...Pricing }, weekly, weeklyHistory };
+            pricing: { ...Pricing }, weekly, weeklyHistory, weeklyRemainder };
         return { report, weeklyOrganizationId: weeklyWindows?.organizationId };
     }
 
-    function scanWithContext()
+    function scanWithContext(weeklyContext)
     {
-        const operation = pending.then(scanSources);
+        const operation = pending.then(() => scanSources(weeklyContext));
         pending = operation.catch(() => {});
         return operation;
     }

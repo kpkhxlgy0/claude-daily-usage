@@ -51,13 +51,15 @@ test('a history-only snapshot is restricted to the runner organization for concu
     const foreign = service.query({ organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' });
     await new Promise(resolve => setImmediate(resolve));
     const now = body().generatedAt;
-    const previous = { startAt: now - 8000, startKind: 'observed', fullAt: null, usedPercent: 20,
-        sampleAt: now - 5000, endAt: now - 3000, partial: true, rows: [] };
+    const resetAt = now - 3000;
+    const previous = { startAt: resetAt - 7 * 24 * 60 * 60 * 1000, resetAt, startKind: 'inferred',
+        fullAt: null, usedPercent: 20, sampleAt: now - 5000, endAt: resetAt - 1, partial: true,
+        afterFull: { requests: 0, usd: 0 }, rows: [] };
     local.worker.emit('message', { type: 'result', weeklyOrganizationId: organizationId,
         report: { ...body(), weekly: null, weeklyHistory: [previous] } });
     assert.deepEqual((await matching).snapshot.weeklyHistory, [previous]);
     assert.deepEqual((await foreign).snapshot.weeklyHistory, []);
-    assert.equal((await local.result).snapshot.schemaVersion, 3);
+    assert.equal((await local.result).snapshot.schemaVersion, 4);
 });
 
 test('cold service exposes stable machine identity without scanning logs', async t =>
@@ -429,4 +431,31 @@ test('real worker publishes a priced native usage row then remains idle', async 
     const before = await fs.stat(reportFile);
     await new Promise(resolve => setTimeout(resolve, 40));
     assert.equal((await fs.stat(reportFile)).mtimeMs, before.mtimeMs);
+});
+
+test('a v3 summary is held for update before any explicit scan', async t =>
+{
+    const { root, service } = await setup(t);
+    const identity = service.getIdentity();
+    await service.dispose();
+    const filename = path.join(root, '.daily-usage', 'summary.json');
+    const old = { ...body(), ...identity, schemaVersion: 3, source: 'com.kpk.daily-usage', revision: 1,
+        weekly: null, weeklyHistory: [] };
+    await fs.writeFile(filename, JSON.stringify(old));
+    const restarted = createService({ claudeHome: root, dataDir: path.join(root, 'data'),
+        now: () => body().generatedAt, workerFactory() { assert.fail('startup must not scan'); } });
+    t.after(() => restarted.dispose());
+    await restarted.ready;
+    assert.deepEqual(restarted.getState(), { status: 'unavailable', error: 'snapshot-update-required', progress: null });
+});
+
+test('a structurally valid oversized v4 report returns the explicit size error', async t =>
+{
+    const { service, workers } = await setup(t);
+    const requested = await started(service, workers);
+    const rows = Array.from({ length: 7000 }, (_, index) => ({ date: '2026-11-17',
+        model: 'model' + index + 'x'.repeat(200), requests: 1, inputTokens: 0, uncachedInputTokens: 0,
+        cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, unpricedRequests: 0, estimatedRequests: 0, usd: 0 }));
+    requested.worker.emit('message', { type: 'result', report: { ...body(), rows } });
+    assert.equal((await requested.result).error, 'snapshot-too-large');
 });
