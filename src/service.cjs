@@ -6,7 +6,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
 const { setTimeout: delay } = require('node:timers/promises');
-const { validateSnapshot, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
+const { validateSnapshot, snapshotWithinLimit, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
 
 const SharingRetryMs = 25;
 
@@ -99,9 +99,11 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
 
     function subscriberState({ organizationId })
     {
-        if (organizationId === undefined || !state.snapshot?.weekly
+        if (organizationId === undefined || !state.snapshot
             || organizationId !== null && organizationId === snapshotOrganizationId) return state;
-        return { ...state, snapshot: { ...state.snapshot, weekly: null } };
+        if (state.snapshot.schemaVersion === 3)
+            return { ...state, snapshot: { ...state.snapshot, weekly: null, weeklyHistory: [] } };
+        return state.snapshot.weekly ? { ...state, snapshot: { ...state.snapshot, weekly: null } } : state;
     }
 
     function settle(subscriber, error, value)
@@ -164,11 +166,10 @@ function createService({ claudeHome, claudeData, dataDir, now = Date.now,
                     publishing = publishing.then(async () =>
                     {
                         if (!active(job)) return;
-                        const snapshot = { weekly: null, ...message.report, schemaVersion: 2, source: 'com.kpk.daily-usage',
-                            machineId, publisherId, revision: revision + 1 };
-                        if (!validateSnapshot(snapshot, { now: now() }).ok
-                            || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)
-                            throw new Error('invalid-report');
+                        const snapshot = snapshotWithinLimit({ weekly: null, weeklyHistory: [], ...message.report,
+                            schemaVersion: 3, source: 'com.kpk.daily-usage', machineId, publisherId,
+                            revision: revision + 1 }, { now: now() });
+                        if (!snapshot) throw new Error('invalid-report');
                         await atomicWrite(reportFile, snapshot, () => active(job), job.controller.signal);
                         await complete(job, null, snapshot, message.weeklyOrganizationId);
                     }).catch(error => complete(job, error));

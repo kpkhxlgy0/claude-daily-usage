@@ -42,6 +42,24 @@ async function started(service, workers, options)
     return { result, worker: workers.at(-1) };
 }
 
+test('a history-only snapshot is restricted to the runner organization for concurrent viewers', async t =>
+{
+    const { service, workers } = await setup(t);
+    const organizationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const local = await started(service, workers);
+    const matching = service.query({ organizationId });
+    const foreign = service.query({ organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' });
+    await new Promise(resolve => setImmediate(resolve));
+    const now = body().generatedAt;
+    const previous = { startAt: now - 8000, startKind: 'observed', fullAt: null, usedPercent: 20,
+        sampleAt: now - 5000, endAt: now - 3000, partial: true, rows: [] };
+    local.worker.emit('message', { type: 'result', weeklyOrganizationId: organizationId,
+        report: { ...body(), weekly: null, weeklyHistory: [previous] } });
+    assert.deepEqual((await matching).snapshot.weeklyHistory, [previous]);
+    assert.deepEqual((await foreign).snapshot.weeklyHistory, []);
+    assert.equal((await local.result).snapshot.schemaVersion, 3);
+});
+
 test('cold service exposes stable machine identity without scanning logs', async t =>
 {
     const { service, workers } = await setup(t);

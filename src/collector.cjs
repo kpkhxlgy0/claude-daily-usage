@@ -6,7 +6,7 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { createLogParser, UsageFields } = require('./log-parser.cjs');
 const { priceRequest, Pricing, validTokens } = require('./pricing.cjs');
-const { readWeeklyWindow } = require('./weekly-history.cjs');
+const { readWeeklyWindows } = require('./weekly-history.cjs');
 
 const DayMs = 24 * 60 * 60 * 1000;
 const BeijingOffsetMs = 8 * 60 * 60 * 1000;
@@ -259,10 +259,11 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
             discoveryErrors: 0, cacheErrors: 0, oversizedRecords: 0, incompleteRequests: 0, ambiguousRequests: 0,
             overflowRequests: 0, unresolvedInheritedRequests: 0 };
         progress('discovering', coverage);
-        const [sources, weeklyHistory] = await Promise.all([
-            discover(coverage), readWeeklyWindow(claudeData, generatedAt),
+        const [sources, weeklyWindows] = await Promise.all([
+            discover(coverage), readWeeklyWindows(claudeData, generatedAt),
         ]);
-        const weeklyWindow = weeklyHistory?.window;
+        const weeklyPeriods = [weeklyWindows?.window, ...(weeklyWindows?.history || [])].map(window => window
+            ? { window, endAt: window.fullAt ?? window.endAt ?? generatedAt, rows: new Map() } : null);
         coverage.files = sources.length;
         const events = [];
         let processedFiles = 0;
@@ -317,8 +318,6 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
         coverage.ambiguousRequests = ambiguous.size;
         coverage.skippedRecords += ambiguous.size;
         const rows = new Map();
-        const weeklyRows = new Map();
-        const weeklyEnd = weeklyWindow?.fullAt ?? generatedAt;
         let unpricedRequests = 0;
         let estimatedRequests = 0;
         for (const event of responses.values())
@@ -332,6 +331,8 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
             const date = beijingDate(event.timestamp);
             if (date < from || date > to) continue;
             coverage.conflictingRequests += event.conflicts || 0;
+            const weeklyPeriod = weeklyPeriods.find(period => period && event.timestamp >= period.window.startAt
+                && event.timestamp <= period.endAt);
             const usageComplete = UsageFields.slice(0, 4).every(key => event[key] !== null);
             if (!usageComplete) coverage.incompleteRequests++;
             const usage = { ...event, usageComplete: usageComplete && !event.conflicted,
@@ -339,8 +340,9 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
                 cacheWriteTokens: event.cacheWriteTokens ?? 0, outputTokens: event.outputTokens ?? 0 };
             usage.inputTokens = usage.uncachedInputTokens + usage.cachedInputTokens + usage.cacheWriteTokens;
             const price = priceRequest(usage);
-            if (weeklyWindow && event.timestamp >= weeklyWindow.startAt && event.timestamp <= weeklyEnd)
+            if (weeklyPeriod)
             {
+                const weeklyRows = weeklyPeriod.rows;
                 let row = weeklyRows.get(event.model);
                 if (!row)
                 {
@@ -394,17 +396,21 @@ function createCollector({ claudeHome, claudeData, cacheDir, now = Date.now, onP
         const result = [...rows.values()].sort((left, right) => right.date.localeCompare(left.date)
             || left.model.localeCompare(right.model));
         for (const row of result) row.usd = Number(row.usd.toFixed(12));
-        const weekly = weeklyWindow ? { ...weeklyWindow,
-            rows: [...weeklyRows.values()].sort((left, right) => left.model.localeCompare(right.model)) } : null;
-        for (const row of weekly?.rows || [])
+        const [weekly, ...weeklyHistory] = weeklyPeriods.map(period =>
         {
-            row.baseUsd = Number(row.baseUsd.toFixed(12));
-            row.usd = Number(row.usd.toFixed(12));
-        }
+            if (!period) return null;
+            const rows = [...period.rows.values()].sort((left, right) => left.model.localeCompare(right.model));
+            for (const row of rows)
+            {
+                row.baseUsd = Number(row.baseUsd.toFixed(12));
+                row.usd = Number(row.usd.toFixed(12));
+            }
+            return { ...period.window, rows };
+        });
         progress('complete', coverage, processedFiles);
         const report = { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, coverage,
-            pricing: { ...Pricing }, weekly };
-        return { report, weeklyOrganizationId: weeklyHistory?.organizationId };
+            pricing: { ...Pricing }, weekly, weeklyHistory };
+        return { report, weeklyOrganizationId: weeklyWindows?.organizationId };
     }
 
     function scanWithContext()

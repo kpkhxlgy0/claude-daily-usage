@@ -157,7 +157,9 @@ test("version 2 is an exact, optional marker field that survives cancellation", 
     assert.equal(marker.snapshotVersion, 2);
     assert.equal(protocol.validateMarker(marker, { binding, now: Now }).ok, true);
     assert.deepEqual(protocol.makeMarker(options, "cancel", marker), { ...marker, action: "cancel", sequence: 2 });
-    for (const value of [undefined, null, 1, 3, "2"]) {
+    const history = protocol.makeMarker({ ...options, snapshotVersion: 3 });
+    assert.equal(protocol.makeMarker(options, "cancel", history).snapshotVersion, 3);
+    for (const value of [undefined, null, 1, 4, "2"]) {
         assert.equal(protocol.validateMarker({ ...marker, snapshotVersion: value }, { binding, now: Now }).ok, false);
     }
 });
@@ -174,6 +176,28 @@ test("five-second machine clock skew keeps the original deadline while rejecting
     assert.throws(() => result("ok", { now: Now - 5001 }));
     const future = result("ok", { now: Now + 5001, snapshot: { ...snapshot(), generatedAt: Now } });
     assert.equal(protocol.validateResult(future, expected).ok, false);
+});
+
+test("oversized history projects to the current week and an oversized daily report returns a terminal error", () => {
+    const { createHash } = require("node:crypto");
+    const models = Array.from({ length: 2400 }, (_, i) => createHash("sha256").update(String(i)).digest("hex"));
+    const base = snapshot();
+    const period = { startAt: Now - 8000, startKind: "inferred", sampleAt: Now - 5000, fullAt: null,
+        usedPercent: 40, endAt: Now - 3000, partial: false, rows: models.map(model =>
+            ({ model, requests: 1, baseUsd: 4, usd: 4, unpricedRequests: 0, estimatedRequests: 0 })) };
+    const current = { ...base, schemaVersion: 2, weekly: null };
+    const history = { ...current, schemaVersion: 3, weeklyHistory: [period] };
+    const fromRunner = value => result("ok", { snapshot: value, snapshotVersion: 3 });
+    const fits = protocol.validateResult(fromRunner(history), { ...expected, snapshotVersion: 3 });
+    assert.deepEqual(fits, { ok: true, snapshot: current });
+    assert.equal(history.weeklyHistory[0].rows.length, models.length);
+    const rows = models.map(model => ({ date: base.to, model, requests: 1, inputTokens: 1,
+        uncachedInputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1,
+        usd: 4, unpricedRequests: 0, estimatedRequests: 0 }));
+    const rejected = fromRunner({ ...history, rows });
+    assert.equal(rejected.status, "error");
+    assert.equal(rejected.error, "snapshot-too-large");
+    assert.equal(protocol.validateResult(rejected, expected).ok, true);
 });
 
 test("compressed aggregates reject invalid base64, inflated bombs and incorrect byte counts", () => {

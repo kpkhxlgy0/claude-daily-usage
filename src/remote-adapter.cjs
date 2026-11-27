@@ -108,8 +108,8 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
 
     async function removeAdvertisement(runner, signal)
     {
-        if (runner.capabilitiesV2) await removeValue(runner.binding, protocol.CapabilitiesV2Key,
-            runner.capabilitiesV2, signal).catch(() => {});
+        for (const key of runner.snapshotCapabilityKeys || [])
+            await removeValue(runner.binding, key, runner.capabilities, signal).catch(() => {});
         if (runner.capabilities) await removeValue(runner.binding, protocol.CapsKey,
             runner.capabilities, signal).catch(() => {});
         if (runner.machine) await removeValue(runner.binding, protocol.MachineKey,
@@ -207,19 +207,18 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             }
             check(controller.signal);
             if (runners.get(runner.key) !== runner || now() >= marker.expiresAt) return;
-            const capabilitiesV2 = detail.metadata[protocol.CapabilitiesV2Key];
-            const weekly = marker.snapshotVersion === protocol.WeeklySnapshotVersion
-                && protocol.supportsWeeklySnapshots(capabilitiesV2, caps);
+            const capKey = protocol.snapshotCapabilityKey(marker.snapshotVersion);
+            const extended = capKey && protocol.supportsWeeklySnapshots(detail.metadata[capKey], caps);
             const result = protocol.makeResult({ requestId, publisherId: identity.publisherId,
                 expiresAt: marker.expiresAt, now: now(), status: value?.status === 'ok' ? 'ok' : 'error',
-                ...(weekly ? { snapshotVersion: marker.snapshotVersion } : {}),
+                ...(extended ? { snapshotVersion: marker.snapshotVersion } : {}),
                 ...(value?.status === 'ok' ? { snapshot: value.snapshot } : { error: 'source-unavailable' }) });
             const key = protocol.resultKey(requestId);
             if (detail.metadata[key] !== null) return;
             await step(transport.patch(runner.binding, [
                 { op: 'test', path: ownedPath(protocol.requestKey(requestId)), value: marker },
                 { op: 'test', path: ownedPath(protocol.CapsKey), value: runner.capabilities },
-                ...(weekly ? [{ op: 'test', path: ownedPath(protocol.CapabilitiesV2Key), value: capabilitiesV2 }] : []),
+                ...(extended ? [{ op: 'test', path: ownedPath(capKey), value: detail.metadata[capKey] }] : []),
                 { op: 'test', path: ownedPath(key), value: null },
                 { op: 'replace', path: ownedPath(key), value: result }
             ], { signal: controller.signal }), controller.signal);
@@ -285,13 +284,13 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             {
                 const operations = [{ op: 'test', path: '', value: detail.metadata },
                     { op: 'add', path: ownedPath(protocol.CapsKey), value }];
-                runner.capabilitiesV2 = null;
-                const previousV2 = detail.metadata[protocol.CapabilitiesV2Key];
-                if (!Object.hasOwn(detail.metadata, protocol.CapabilitiesV2Key)
-                    || protocol.validateCapabilities(previousV2).ok)
+                runner.snapshotCapabilityKeys = [];
+                for (const key of [protocol.CapabilitiesV2Key, protocol.CapabilitiesV3Key])
                 {
-                    runner.capabilitiesV2 = value;
-                    operations.push({ op: 'add', path: ownedPath(protocol.CapabilitiesV2Key), value });
+                    if (Object.hasOwn(detail.metadata, key) && !protocol.validateCapabilities(detail.metadata[key]).ok)
+                        continue;
+                    runner.snapshotCapabilityKeys.push(key);
+                    operations.push({ op: 'add', path: ownedPath(key), value });
                 }
                 let machine;
                 try
@@ -494,9 +493,10 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
             {
                 if (Object.hasOwn(detail.metadata, key) || Object.hasOwn(detail.metadata, resultKey))
                     throw failure('request-conflict');
-                const weekly = protocol.supportsWeeklySnapshots(detail.metadata[protocol.CapabilitiesV2Key], caps);
+                const snapshotVersion = [protocol.HistorySnapshotVersion, protocol.WeeklySnapshotVersion].find(version =>
+                    protocol.supportsWeeklySnapshots(detail.metadata[protocol.snapshotCapabilityKey(version)], caps));
                 marker = protocol.makeMarker({ requestId, publisherId: caps.publisherId,
-                    viewerId, binding, now: now(), ...(weekly ? { snapshotVersion: protocol.WeeklySnapshotVersion } : {}) });
+                    viewerId, binding, now: now(), snapshotVersion });
                 write = transport.patch(binding, [{ op: 'test', path: '', value: detail.metadata },
                     { op: 'add', path: ownedPath(key), value: marker },
                     { op: 'add', path: ownedPath(resultKey), value: null }], { signal: controller.signal });
@@ -527,7 +527,9 @@ function createRemoteAdapter({ service, claudeHome, claudeData, transport, now =
                 now: now() });
             if (!parsed.ok) throw failure(parsed.reason === 'update-required'
                 ? 'snapshot-update-required' : 'snapshot-invalid');
-            if (received.status !== 'ok') throw failure(received.status === 'cancelled' ? 'cancelled' : 'source-unavailable');
+            if (received.status === 'cancelled') throw failure('cancelled');
+            if (received.status === 'error')
+                throw failure(received.error === 'snapshot-too-large' ? 'snapshot-too-large' : 'source-unavailable');
             check(controller.signal);
             const history = accepted.get(hostId);
             const previous = history?.snapshot;

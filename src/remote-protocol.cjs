@@ -7,8 +7,10 @@ const { normalizeThreadId, snapshotForPeer, validateSnapshot, MaxSnapshotBytes, 
 const Source = "com.kpk.daily-usage";
 const CapsKey = "claudepp_daily_usage";
 const CapabilitiesV2Key = "claudepp_daily_usage_capabilities_v2";
+const CapabilitiesV3Key = "claudepp_daily_usage_capabilities_v3";
 const MachineKey = "claudepp_daily_usage_machine";
 const WeeklySnapshotVersion = 2;
+const HistorySnapshotVersion = 3;
 const MaxDemandMs = 300000;
 const MaxCompressedBytes = 64 * 1024;
 const Prefixes = { query: "d411ea01", result: "d411ea02", cancel: "d411ea03" };
@@ -70,9 +72,14 @@ function validateCapabilities(value) {
         && version(value) && uuid(value.machineId) && uuid(value.publisherId) ? { ok: true } : invalid("invalid");
 }
 
-function supportsWeeklySnapshots(capabilitiesV2, capabilities) {
-    return validateCapabilities(capabilitiesV2).ok && validateCapabilities(capabilities).ok
-        && capabilitiesV2.machineId === capabilities.machineId && capabilitiesV2.publisherId === capabilities.publisherId;
+function snapshotCapabilityKey(version) {
+    if (version === HistorySnapshotVersion) return CapabilitiesV3Key;
+    if (version === WeeklySnapshotVersion) return CapabilitiesV2Key;
+}
+
+function supportsWeeklySnapshots(advertisement, capabilities) {
+    return validateCapabilities(advertisement).ok && validateCapabilities(capabilities).ok
+        && advertisement.machineId === capabilities.machineId && advertisement.publisherId === capabilities.publisherId;
 }
 
 function normalizeMachineName(value) {
@@ -112,12 +119,12 @@ function makeMarker(options, action = "query", original) {
         return { ...original, action: "cancel", sequence: 2 };
     }
     if (action !== "query" || !Number.isSafeInteger(now + MaxDemandMs)
-        || snapshotVersion !== undefined && snapshotVersion !== WeeklySnapshotVersion) {
+        || snapshotVersion !== undefined && !snapshotCapabilityKey(snapshotVersion)) {
         throw new TypeError("Invalid Daily Usage marker");
     }
     return { ...base(), requestId: id, publisherId, viewerId, bridgeSessionId, organizationId,
         action, sequence: 1, requestedAt: now, expiresAt: now + MaxDemandMs,
-        ...(snapshotVersion === WeeklySnapshotVersion ? { snapshotVersion } : {}) };
+        ...(snapshotVersion !== undefined ? { snapshotVersion } : {}) };
 }
 
 function validateMarker(value, options = {}) {
@@ -125,7 +132,7 @@ function validateMarker(value, options = {}) {
     const { binding, now = Date.now() } = options;
     const keys = ["source", "schemaVersion", "demandVersion", "requestId", "publisherId", "viewerId",
         "bridgeSessionId", "organizationId", "action", "sequence", "requestedAt", "expiresAt"];
-    if (value?.snapshotVersion === WeeklySnapshotVersion) keys.push("snapshotVersion");
+    if (snapshotCapabilityKey(value?.snapshotVersion)) keys.push("snapshotVersion");
     if (!validBinding(binding) || !integer(now)
         || !fields(value, keys)
         || !version(value) || !requestId(value.requestId) || !uuid(value.publisherId) || !uuid(value.viewerId)
@@ -147,10 +154,21 @@ function makeResult(options) {
         if (!validateSnapshot(snapshot, { now }).ok || snapshot.publisherId !== publisherId) {
             throw new TypeError("Invalid Daily Usage snapshot");
         }
-        const bytes = Buffer.from(JSON.stringify(snapshotForPeer(snapshot, snapshotVersion)), "utf8");
-        const compressed = deflateSync(bytes);
-        if (compressed.length > MaxCompressedBytes) throw new RangeError("Daily Usage result exceeds size limit");
-        value.data = { encoding: "deflate-base64", bytes: bytes.length, dataBase64: compressed.toString("base64") };
+        let projected = snapshotForPeer(snapshot, snapshotVersion);
+        for (;;) {
+            const bytes = Buffer.from(JSON.stringify(projected), "utf8");
+            const compressed = deflateSync(bytes);
+            if (compressed.length <= MaxCompressedBytes) {
+                value.data = { encoding: "deflate-base64", bytes: bytes.length, dataBase64: compressed.toString("base64") };
+                break;
+            }
+            if (projected.schemaVersion === 1) {
+                value.status = "error";
+                value.error = "snapshot-too-large";
+                break;
+            }
+            projected = snapshotForPeer(projected, projected.schemaVersion - 1);
+        }
     } else if (status === "error") value.error = error;
     if (!validateResult(value, { requestId: id, publisherId, machineId: snapshot?.machineId, snapshotVersion, now }).ok) {
         throw new TypeError("Invalid Daily Usage result");
@@ -192,7 +210,7 @@ function validateResult(value, options = {}) {
         const checked = validateSnapshot(snapshot, { now });
         if (!checked.ok && checked.reason !== "update-required") return checked;
         if (snapshot.machineId !== machineId || snapshot.publisherId !== publisherId) return invalid("identity");
-        if (snapshot.schemaVersion === WeeklySnapshotVersion && snapshotVersion !== WeeklySnapshotVersion)
+        if (snapshot.schemaVersion > (snapshotCapabilityKey(snapshotVersion) ? snapshotVersion : 1))
             return invalid("invalid");
         if (!checked.ok) return checked;
         return { ok: true, snapshot };
@@ -200,6 +218,7 @@ function validateResult(value, options = {}) {
 }
 
 module.exports = { createRequestId, signalId, parseSignalId, normalizeBridgeId, validBinding, CapsKey, MachineKey,
-    CapabilitiesV2Key, WeeklySnapshotVersion, supportsWeeklySnapshots, normalizeMachineName, makeMachine, validateMachine,
+    CapabilitiesV2Key, CapabilitiesV3Key, WeeklySnapshotVersion, HistorySnapshotVersion, snapshotCapabilityKey,
+    supportsWeeklySnapshots, normalizeMachineName, makeMachine, validateMachine,
     requestKey, resultKey, makeCapabilities, makeMarker, validateMarker, validateCapabilities, makeResult,
     validateResult, MaxDemandMs };

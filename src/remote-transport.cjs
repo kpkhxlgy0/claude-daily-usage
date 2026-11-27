@@ -4,7 +4,8 @@ const { randomUUID } = require("node:crypto");
 const { inflateSync } = require("node:zlib");
 const { MaxSnapshotBytes, normalizeThreadId } = require("./protocol.cjs");
 const { signalId, parseSignalId, normalizeBridgeId, validBinding, resultKey, CapsKey, MachineKey,
-    CapabilitiesV2Key, WeeklySnapshotVersion, supportsWeeklySnapshots, validateCapabilities, validateMachine,
+    CapabilitiesV2Key, CapabilitiesV3Key, HistorySnapshotVersion, snapshotCapabilityKey,
+    supportsWeeklySnapshots, validateCapabilities, validateMachine,
     validateMarker, validateResult } = require("./remote-protocol.cjs");
 
 const MaxBodyBytes = 1024 * 1024;
@@ -24,17 +25,17 @@ function cancelBody(response) {
 
 function ownedKey(key) {
     if (key === CapsKey) return { kind: "caps" };
-    if (key === CapabilitiesV2Key) return { kind: "caps-v2" };
+    if (key === CapabilitiesV2Key || key === CapabilitiesV3Key) return { kind: "snapshot-caps" };
     if (key === MachineKey) return { kind: "machine" };
     const match = /^claudepp_daily_usage_(request|result)_([0-9a-f-]{36})$/.exec(key);
     const parsed = match && match[0] === key && parseSignalId(match[2]);
     return parsed?.kind === "query" ? { kind: match[1], requestId: parsed.requestId } : null;
 }
 
-function validOwnedValue(key, value, binding, snapshotVersion = WeeklySnapshotVersion, machineId) {
+function validOwnedValue(key, value, binding, snapshotVersion = HistorySnapshotVersion, machineId) {
     const owned = ownedKey(key);
     if (!owned) return false;
-    if (owned.kind === "caps" || owned.kind === "caps-v2") return validateCapabilities(value).ok;
+    if (owned.kind === "caps" || owned.kind === "snapshot-caps") return validateCapabilities(value).ok;
     if (owned.kind === "machine") return record(value) && validateMachine(value, {
         source: value.source, schemaVersion: value.schemaVersion, demandVersion: value.demandVersion,
         machineId: value.machineId, publisherId: value.publisherId }).ok;
@@ -69,9 +70,10 @@ function validateOperations(operations, binding) {
             && !Object.hasOwn(operations[0].value, marker.path.slice(1))
             && !Object.hasOwn(operations[0].value, result.path.slice(1))) {
             const capabilities = operations[0].value[CapsKey];
-            if (marker.value.snapshotVersion === WeeklySnapshotVersion
+            const capKey = snapshotCapabilityKey(marker.value.snapshotVersion);
+            if (capKey
                 && (marker.value.publisherId !== capabilities?.publisherId
-                    || !supportsWeeklySnapshots(operations[0].value[CapabilitiesV2Key], capabilities))) return false;
+                    || !supportsWeeklySnapshots(operations[0].value[capKey], capabilities))) return false;
             reserved.add(result.path.slice(1));
         }
     }
@@ -97,22 +99,22 @@ function validateOperations(operations, binding) {
         }
         if (!compared.has(key) && root === undefined) return false;
         if (root && Object.hasOwn(root, key) && !validOwnedValue(key, root[key], binding)) return false;
-        let snapshotVersion = WeeklySnapshotVersion;
+        let snapshotVersion = HistorySnapshotVersion;
         let machineId;
         if (owned.kind === "result" && compared.has(key) && compared.get(key) === null && operation.op !== "remove") {
             const marker = compared.get(markerKey), caps = compared.get(CapsKey);
             if (!marker || marker.action !== "query" || !caps || caps.publisherId !== marker.publisherId
                 || operation.value?.publisherId !== marker.publisherId) return false;
-            if (marker.snapshotVersion !== WeeklySnapshotVersion
-                || !supportsWeeklySnapshots(compared.get(CapabilitiesV2Key), caps)) snapshotVersion = 1;
+            const capKey = snapshotCapabilityKey(marker.snapshotVersion);
+            snapshotVersion = capKey && supportsWeeklySnapshots(compared.get(capKey), caps) ? marker.snapshotVersion : 1;
             machineId = caps.machineId;
         }
         if (operation.op !== "remove" && !(operation.value === null && reserved.has(key))) {
             if (!validOwnedValue(key, operation.value, binding, snapshotVersion, machineId)) return false;
-            if (owned.kind === "request" && operation.value.snapshotVersion === WeeklySnapshotVersion
+            if (owned.kind === "request" && snapshotCapabilityKey(operation.value.snapshotVersion)
                 && operation.value.action === "query" && !reserved.has(resultKey(owned.requestId))) return false;
             if (owned.kind === "caps") advertisedCaps = operation.value;
-            if (owned.kind === "caps-v2"
+            if (owned.kind === "snapshot-caps"
                 && !supportsWeeklySnapshots(operation.value, advertisedCaps ?? compared.get(CapsKey) ?? root?.[CapsKey]))
                 return false;
         }

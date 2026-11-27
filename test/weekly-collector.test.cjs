@@ -94,6 +94,178 @@ test('the next observed period excludes replies from the preceding full period',
     assert.equal(weekly.rows[0].requests, 2);
 });
 
+test('three completed cycles use separate request ranges through each trusted cutoff', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-610, 4), sample(-465, 72), sample(-460, 0), sample(-459, 1), sample(-354, 100), sample(-315, 100),
+        sample(-300, 0), sample(-299, 2), sample(-170, 80), sample(-155, 0), sample(-154, 3), sample(-8, 60),
+        sample(0, 0), sample(2, 8),
+    ], responses: [response('too-old', -465), response('old-start', -460), response('first-full', -354),
+        response('after-full', -353), response('middle-start', -300), response('newer-start', -155),
+        response('safe-end', -8), response('uncertain', -7), response('newer-start', 0), response('current', 0)] });
+    const { report, weeklyOrganizationId } = await collector.scanWithContext();
+    assert.equal(weeklyOrganizationId, OrgA);
+    assert.deepEqual(report.weeklyHistory.map(week => [week.startAt, week.sampleAt, week.endAt, week.fullAt,
+        week.usedPercent, week.partial, week.rows[0].requests]), [
+        [Start - 155 * Hour, Start - 8 * Hour, Start - 8 * Hour, null, 60, true, 2],
+        [Start - 300 * Hour, Start - 170 * Hour, Start - 170 * Hour, null, 80, true, 1],
+        [Start - 460 * Hour, Start - 315 * Hour, Start - 315 * Hour, Start - 354 * Hour, 100, true, 2],
+    ]);
+    assert.equal(report.weekly.rows[0].requests, 1);
+    assert.equal(report.rows.reduce((sum, row) => sum + row.requests, 0), 9);
+});
+
+test('an expired cycle does not absorb observations from an unconfirmed intervening cycle', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-470, 2), sample(-340, 80), sample(-330, 0), sample(-329, 3), sample(-175, 40),
+        sample(-148, 42), sample(-15, 90), sample(-3, 0), sample(-2, 1),
+    ], responses: [response('old-safe', -175), response('old-uncertain', -174.5), response('intervening', -148),
+        response('current-start', -3)] });
+    const { weekly, weeklyHistory } = await collector.scan();
+    assert.equal(weekly?.startAt, Start - 3 * Hour);
+    assert.equal(weeklyHistory[0], null);
+    assert.equal(weeklyHistory[1].startAt, Start - 330 * Hour);
+    assert.equal(weeklyHistory[1].endAt, Start - 175 * Hour);
+    assert.equal(weeklyHistory[1].usedPercent, 40);
+    assert.equal(weeklyHistory[1].rows[0].requests, 1);
+});
+
+test('an extended sampling gap leaves the prior slot unassigned', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-480, 10), sample(-350, 80), sample(-332, 0), sample(-331, 2), sample(-200, 100),
+        sample(0, 10), sample(2, 12),
+    ], responses: [response('before-gap', -201), response('within-gap', -20), response('current', 0)] });
+    const { weekly, weeklyHistory } = await collector.scan();
+    assert.equal(weekly?.startAt, Start);
+    assert.equal(weekly.rows[0].requests, 1);
+    assert.deepEqual(weeklyHistory, [null]);
+});
+
+test('overlapping expiry bounds leave an uncertain history position empty', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-320, 2), sample(-180, 80), sample(-160, 0), sample(-159, 2), sample(-20, 45),
+        sample(0, 60), sample(1, 0), sample(2, 5),
+    ] });
+    const { weekly, weeklyHistory } = await collector.scan();
+    assert.equal(weekly?.startAt, Start + Hour);
+    assert.deepEqual(weeklyHistory, [null]);
+});
+
+test('definitely elapsed weeks shift confirmed periods into their proven historical slots', async t =>
+{
+    const samples = [sample(-320, 2), sample(-175, 75), sample(-168, 0), sample(-167, 5), sample(-8, 60),
+        sample(0, 0), sample(2, 7), sample(120, 100), sample(149, 100), sample(165, 100)];
+    const responses = [response('at-full', 120), response('after-full', 121), response('late-sample', 165),
+        response('past-retention', -800), response('past-retention', 119), response('future', 600)];
+    for (const [hour, index] of [[170, 0], [340, 1], [510, 2]])
+    {
+        const { collector } = await setup(t, { hour, samples, responses });
+        const { report, weeklyOrganizationId } = await collector.scanWithContext();
+        assert.equal(report.weekly, null);
+        assert.equal(weeklyOrganizationId, OrgA);
+        const starts = [Start, Start - Week, Start - 320 * Hour];
+        assert.deepEqual(report.weeklyHistory.map(week => week?.startAt ?? null),
+            [...Array(index).fill(null), ...starts.slice(0, 3 - index)]);
+        const week = report.weeklyHistory[index];
+        assert.equal(week.sampleAt, Start + 149 * Hour);
+        assert.equal(week.endAt, Start + 149 * Hour);
+        assert.equal(week.fullAt, Start + 120 * Hour);
+        assert.equal(week.rows[0].requests, 1);
+        assert.equal(report.rows.reduce((sum, row) => sum + row.requests, 0), 3);
+    }
+});
+
+test('queries between possible expiry times leave historical positions unassigned', async t =>
+{
+    const samples = [sample(-140, 2), sample(-8, 60), sample(0, 0), sample(2, 7), sample(120, 30), sample(162, 35)];
+    for (const hour of [164, 332])
+    {
+        const { collector } = await setup(t, { hour, samples });
+        const { report, weeklyOrganizationId } = await collector.scanWithContext();
+        assert.equal(report.weekly, null);
+        assert.equal(report.weeklyHistory.some(Boolean), false);
+        assert.equal(weeklyOrganizationId, undefined);
+    }
+});
+
+test('a pending drop within the expiry bounds preserves already proven historical positions', async t =>
+{
+    const { collector } = await setup(t, { hour: 170, samples: [
+        sample(-140, 2), sample(-8, 60), sample(0, 0), sample(2, 7), sample(120, 30), sample(166, 0),
+    ], responses: [response('old-safe', 120), response('pending-drop', 166)] });
+    const { report, weeklyOrganizationId } = await collector.scanWithContext();
+    assert.equal(report.weekly, null);
+    assert.equal(weeklyOrganizationId, OrgA);
+    assert.deepEqual(report.weeklyHistory.map(week => week.startAt), [Start, Start - 140 * Hour]);
+    assert.equal(report.weeklyHistory[0].usedPercent, 30);
+    assert.equal(report.weeklyHistory[0].endAt, Start + 120 * Hour);
+    assert.equal(report.weeklyHistory[0].rows[0].requests, 1);
+    assert.equal(report.rows.reduce((sum, row) => sum + row.requests, 0), 2);
+});
+
+test('a pending drop leaves positions empty when the reset count may change', async t =>
+{
+    for (const [hour, dropAt] of [[170, 159], [170, 169], [164, 162], [332, 166]])
+    {
+        const { collector } = await setup(t, { hour, samples: [
+            sample(-140, 2), sample(-8, 60), sample(0, 0), sample(2, 7), sample(120, 30), sample(dropAt, 0),
+        ] });
+        const { weekly, weeklyHistory } = await collector.scan();
+        assert.equal(weekly, null);
+        assert.equal(weeklyHistory.some(Boolean), false);
+    }
+});
+
+test('elapsed time alone cannot place an unbounded post-gap window', async t =>
+{
+    const { collector } = await setup(t, { hour: 170, samples: [sample(-200, 85), sample(0, 40), sample(2, 60)] });
+    const { weekly, weeklyHistory } = await collector.scan();
+    assert.equal(weekly, null);
+    assert.equal(weeklyHistory.some(Boolean), false);
+});
+
+test('a second confirmed dip in the same low band does not create an extra quota cycle', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-520, 2), sample(-470, 60), sample(-270, 0), sample(-130, 35), sample(-120, 10),
+        sample(-119.5, 10), sample(-116, 0), sample(-115, 0), sample(-50, 45), sample(0, 0), sample(2, 7),
+    ] });
+    const { weekly, weeklyHistory } = await collector.scan();
+    assert.equal(weekly?.startAt, Start);
+    assert.deepEqual(weeklyHistory.map(week => week?.startAt ?? null), [Start - 116 * Hour,
+        Start - 270 * Hour, null]);
+    assert.equal(weeklyHistory[1].usedPercent, 35);
+    assert.equal(weeklyHistory[1].endAt, Start - 130 * Hour);
+});
+
+test('same-organization history is available with an unavailable current percentage', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-144, 5), sample(-8, 70), sample(0, 0), sample(2, 7), sample(4, undefined),
+    ] });
+    const { report, weeklyOrganizationId } = await collector.scanWithContext();
+    assert.equal(report.weekly, null);
+    assert.equal(report.weeklyHistory.length, 1);
+    assert.equal(report.weeklyHistory[0].usedPercent, 70);
+    assert.equal(weeklyOrganizationId, OrgA);
+});
+
+test('a switch to a different organization drops the former organization’s completed cycles', async t =>
+{
+    const { collector } = await setup(t, { samples: [
+        sample(-460, 10), sample(-335, 70), sample(-320, 0), sample(-319, 5), sample(-158, 75),
+        sample(-155, 2, OrgB), sample(-154, 3, OrgB), sample(-5, 20, OrgB),
+        sample(0, 0, OrgB), sample(2, 4, OrgB),
+    ] });
+    const { report, weeklyOrganizationId } = await collector.scanWithContext();
+    assert.equal(report.weekly, null);
+    assert.deepEqual(report.weeklyHistory.map(week => week?.startAt ?? null), [Start - 155 * Hour]);
+    assert.equal(weeklyOrganizationId, OrgB);
+});
+
 test('an isolated drop followed by recovery preserves the original first 100 percent sample', async t =>
 {
     const { collector } = await setup(t, { samples: [
