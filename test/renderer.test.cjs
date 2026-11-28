@@ -407,7 +407,9 @@ test('weekly detail shows full-cycle model costs and both sides of the first obs
     assert.match(detail.querySelector('[data-weekly-split]').textContent,
         /首次观测满额.*11\/15 20:00.*截至首次观测的 100%.*16 次.*\$1,755\.33.*首次观测的 100% 之后.*4 次.*\$101\.005/s);
     assert.doesNotMatch(detail.querySelector('[data-weekly-split]').textContent, /余额|已扣|已支付/);
-    assert.match(table.tHead.textContent, /Standard API 等价金额（USD）/);
+    const amountHeader = table.tHead.querySelector('[aria-sort="descending"]');
+    assert.equal(amountHeader.textContent, '金额');
+    assert.equal(amountHeader.title, 'Standard API 等价金额（USD）');
     assert.doesNotMatch(table.tHead.textContent, /基础价|含长上下文/);
     assert.match(weekly.querySelector('[data-weekly-summary="usd"]').textContent, /^\$1,856\.335(?:（|$)/);
     assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '20');
@@ -548,7 +550,9 @@ test('estimated cache writes are visible beside total and row dollars while unpr
     assert.match(root.querySelector('[data-coverage]').textContent, /1 次请求含估算/);
     assert.doesNotMatch(root.querySelector('[data-coverage]').textContent, /旧版请求/);
     assert.match(root.querySelector('.daily-usage-card:nth-child(2) small').textContent, /Standard API 等价金额（USD）/);
-    assert.match(root.querySelector('th:last-child').textContent, /Standard API 等价金额（USD）/);
+    const amountHeader = root.querySelector('[data-calendar] thead th:last-child');
+    assert.equal(amountHeader.textContent, '金额');
+    assert.equal(amountHeader.title, 'Standard API 等价金额（USD）');
     assert.match(root.textContent, /订阅账单与额度以服务商记录为准/);
 });
 
